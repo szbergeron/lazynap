@@ -1,4 +1,5 @@
 use battery::*;
+use procfs::process::{Stat, Status};
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
@@ -70,7 +71,12 @@ impl System {
         System {
             context: Context::default(),
             //devices: vec![Wifi::create(), Bluetooth::create(), Platform::create()],
-            devices: vec![Display::create(), Wifi::create(), Bluetooth::create(), Platform::create()],
+            devices: vec![
+                Display::create(),
+                Wifi::create(),
+                Bluetooth::create(),
+                Platform::create(),
+            ],
             //devices: vec![Platform::create()],
             //devices: vec![Display::create()],
             battery_manager: battery::Manager::new().unwrap(),
@@ -163,13 +169,21 @@ impl System {
 
         //let mut o = execute::shell("turbostat --show Pkg%pc2,Pkg%pc3,Pkg%pc6,Pkg%pc7,Pkg%pc8,Pkg%pc9,Pk%pc10,SYS%LPI sleep 300");
         //let mut o = execute::shell("power-usage-report");
-        let mut o = execute::shell("true");
-        let o = o.output().unwrap();
-        let os = String::from_utf8(o.stdout).unwrap();
-        let oe = String::from_utf8(o.stderr).unwrap();
-        println!("Output:");
-        println!("{os}");
-        println!("{oe}");
+        let mut o = execute::shell("/home/sawyer/oss/idle/while_sleeping.sh");
+        let o = o.output();
+        if let Ok(o) = o {
+            let os = String::from_utf8(o.stdout).unwrap_or(String::new());
+            let oe = String::from_utf8(o.stderr).unwrap_or(String::new());
+
+            //use std::fmt::Write;
+            let f = std::fs::File::create("/home/sawyer/oss/idle/while_sleeping_output.txt");
+            if let Ok(mut f) = f {
+                let _ = writeln!(f, "Stdout:");
+                let _ = writeln!(f, "{os}");
+                let _ = writeln!(f, "Stderr:");
+                let _ = writeln!(f, "{oe}");
+            }
+        }
     }
 
     fn resume(&mut self) {
@@ -180,7 +194,10 @@ impl System {
     }
 
     fn print_report(&mut self) {
-        println!("Current power status is: {:?}", BatteryStatistic::collect(self.battery_manager.batteries().unwrap()));
+        println!(
+            "Current power status is: {:?}",
+            BatteryStatistic::collect(self.battery_manager.batteries().unwrap())
+        );
         for dev in self.devices.iter_mut() {
             let rep = dev.report().unwrap();
             let devname = dev.name();
@@ -333,7 +350,9 @@ struct DeviceStateTransition {
 impl DeviceStateTransition {
     pub fn new(old: DeviceState, new: DeviceState) -> Self {
         Self {
-            old, new, time: Instant::now(),
+            old,
+            new,
+            time: Instant::now(),
         }
     }
 
@@ -427,20 +446,276 @@ impl PoweredDevice for Display {
     }
 }
 
+struct ProcessStats {
+    utime: u64,
+    stime: u64,
+    command: String,
+    pid: i32,
+    was_suspended: bool,
+}
+
+struct FreezableProcess {
+    backing_process: procfs::process::Process,
+
+    stats_on_freeze: (
+        Option<procfs::process::Stat>,
+        Option<procfs::process::Status>,
+    ),
+
+    suspended: bool,
+}
+
+impl FreezableProcess {
+    pub fn new(on: procfs::process::Process) -> Self {
+        Self {
+            suspended: false,
+            stats_on_freeze: (None, None),
+            backing_process: on,
+        }
+    }
+
+    pub fn pid(&self) -> i32 {
+        self.backing_process.pid()
+    }
+
+    pub fn suspend_anyway_kws() -> &'static [&'static str] {
+        &[
+            "evolution",
+            "fwupd",
+            "akonadi",
+            "sidewinderd",
+
+            "NetworkManager",
+            //"upowerd",
+            //"khugepaged",
+            //"netns",
+
+            //"dbus-daemon",
+            //"dconf-service",
+            //"iio_sensor_prox",
+            //"wpa_supplicant",
+
+        ]
+    }
+
+    pub fn continue_anyway_kws() -> &'static [&'static str] {
+        &[
+            //"systemd",
+
+            "bash",
+            "tmux",
+            "asciinema",
+            "cargo",
+            "lid",
+            "idle",
+            "sot",
+            "htop",
+            "powertop",
+            "power-usage-report",
+            "turbostat",
+            "sleep",
+        ]
+    }
+
+    pub fn should_suspend(&mut self) -> bool {
+        let comm = self.backing_process.stat.comm.as_str();
+        let owner = self.backing_process.owner;
+        let cmdline = self.backing_process.cmdline().unwrap_or(Vec::new());
+        let cmdline = cmdline.as_slice();
+        let pid = self.pid();
+
+        let should = if owner < 1000 {
+            // this is a root or system owned process
+
+            Self::suspend_anyway_kws().iter().find(|kw| comm.contains(*kw)).is_some()
+        } else {
+            // this is user owned
+
+            Self::continue_anyway_kws().iter().find(|kw| comm.contains(*kw)).is_none()
+        };
+
+        println!("Declares {pid} {comm}: {cmdline:?} should be in suspend state {should}, it is owned by {owner}");
+
+        should
+    }
+
+    pub fn suspend(&mut self) {
+        self.stats_on_freeze = self.stats();
+
+        if self.should_suspend() {
+            self.suspended = true;
+
+            //println!("Sending {} a sigstop", self.backing_process.stat.comm);
+            self.signal(Signal::SIGSTOP);
+        }
+    }
+
+    pub fn stats(&mut self) -> (Option<Stat>, Option<Status>) {
+            (
+                self.backing_process.stat().ok(),
+                self.backing_process.status().ok()
+            )
+    }
+
+    pub fn resume(&mut self) -> Option<ProcessStats> {
+        let new_stats = self.stats();
+
+        let r = match (self.stats_on_freeze.clone(), new_stats) {
+            ((Some(old_stat), Some(old_status)), (Some(new_stat), Some(new_status))) => {
+                Some(ProcessStats {
+                    pid: self.pid(),
+                    command: new_stat.comm,
+                    utime: new_stat.utime - old_stat.utime,
+                    stime: new_stat.stime - old_stat.stime,
+                    was_suspended: self.suspended,
+                })
+            },
+            _ => {
+                None
+            } // oh well
+        };
+
+        if self.suspended {
+            //println!("Sending {} a sigcont", self.backing_process.stat.comm);
+            self.signal(Signal::SIGCONT);
+
+            self.suspended = false;
+        }
+
+        r
+
+    }
+
+    fn signal(&mut self, sig: Signal) {
+        let pid = self.pid();
+        let res = nix::sys::signal::kill(Pid::from_raw(pid), sig);
+
+        match res {
+            Err(v) => {
+                println!("Couldn't send {sig} to pid {pid}, error: {v}");
+            }
+            _ => (),
+        }
+    }
+}
+
+struct Cpus {
+    // vec of cpu ids
+    //available: Vec<u64>,
+
+    //enabled: Vec<u64>,
+}
+
+impl Cpus {
+    fn parse_range(line: &str) -> Vec<usize> {
+        let mut builder = Vec::new();
+
+        let ranges = line.split(",");
+
+        for range in ranges {
+            let mut elements = range.split("-");
+
+            let start: usize = elements.next().unwrap_or("0").parse().unwrap_or(0);
+            let end: usize = elements.next().unwrap_or("0").parse().unwrap_or(0);
+
+            for id in start..=end {
+                builder.push(id);
+            }
+        }
+
+        builder.sort();
+        builder.dedup();
+
+        builder
+    }
+
+    fn get_cpu_range(file: &str) -> Vec<usize> {
+        if let Ok(contents) = std::fs::read_to_string(file) {
+            for line in contents.lines() {
+                return Self::parse_range(line)
+            }
+        }
+
+        Vec::new()
+    }
+
+    fn detect_available(&mut self) -> Vec<usize> {
+        Self::get_cpu_range("/sys/devices/system/cpu/possible")
+    }
+
+    fn detect_enabled(&mut self) -> Vec<usize> {
+        Self::get_cpu_range("/sys/devices/system/cpu/online")
+    }
+
+    fn set_cpu_state(&mut self, cpus: Vec<(usize, bool)>) {
+        for (cpid, enabled) in cpus {
+            let enabled = if enabled { "1" } else { "0" };
+            println!("Setting state of core {cpid} to {enabled}");
+            execute::shell(format!("echo {enabled} > /sys/devices/system/cpu/cpu{cpid}/online")).output();
+        }
+    }
+
+    fn disabled_set(&mut self) -> Vec<(usize, bool)> {
+        let mut cpus: Vec<(usize, bool)> = self.detect_available().into_iter().map(|cpid| (cpid, false)).collect();
+
+        cpus
+    }
+
+    fn enable_count(&mut self, count: usize) {
+        // failsafe so we never disable all cores
+        let count = count.max(1);
+
+        let mut cpus = self.disabled_set();
+
+        for i in 0..(count.min(cpus.len())) {
+            cpus[i].1 = true;
+        }
+
+        self.set_cpu_state(cpus);
+    }
+
+    fn superpowersave(&mut self) {
+        // we will enable a single core
+
+        self.enable_count(1);
+    }
+
+    fn powersave(&mut self) {
+        self.enable_count(4);
+    }
+
+    fn performance(&mut self) {
+        self.enable_count(128); // just...don't use this script with a dual socket amd epyc :)
+    }
+
+    fn create() -> Self {
+        Self {}
+    }
+}
+
 /// Describes the SoC/RAM/Chipset
 /// as a power manageable component
 ///
 /// Here, only for tracking when we
 /// try entering different power states such as "sleep"
 struct Platform {
-    frozen_processes: Vec<Process>,
+    frozen_processes: Vec<FreezableProcess>,
     state: DeviceState,
     log: Vec<DeviceStateTransition>,
+
+    cpus: Cpus,
+
+    cstate_stats: Vec<u64>,
+
+    processes: Vec<procfs::process::Process>,
 }
 
 impl Platform {
     fn create() -> Box<Self> {
         let s = Self {
+            cpus: Cpus::create(),
+            cstate_stats: vec![0u64; 7],
+            processes: Vec::new(),
             frozen_processes: Vec::new(),
             state: DeviceState::present_on(),
             log: vec![DeviceStateTransition::first()],
@@ -451,55 +726,129 @@ impl Platform {
         b
     }
 
+    fn gather_procs(&mut self) -> Vec<FreezableProcess> {
+        let mut r: Vec<FreezableProcess> = procfs::process::all_processes().unwrap().into_iter().map(|proc| {
+            FreezableProcess::new(proc)
+        }).collect();
+
+        r.sort_by_key(|p| p.pid());
+
+        r
+    }
+
+    fn get_cstate_stats(&self) -> Vec<u64> {
+        let empty = vec![0u64; 7];
+
+        let cf = File::open("/sys/kernel/debug/pmc_core/package_cstate_show");
+
+        if let Ok(mut cf) = cf {
+            let mut build = Vec::new();
+            let mut buf = String::new();
+
+            cf.read_to_string(&mut buf);
+
+            for line in buf.lines() {
+                let num = line.split_whitespace().last().unwrap_or("0").parse().unwrap_or(0);
+
+                build.push(num);
+            }
+
+            build
+
+        } else {
+            empty
+        }
+    }
+
+    fn print_cstate_stats(&self, old: Vec<u64>, new: Vec<u64>) {
+        println!("Cstate stats:");
+        let combined: Vec<u64> = old
+            .iter()
+            .zip(new.iter())
+            .map(|(a, b)| b - a)
+            .collect();
+
+        let labels = vec!["C2", "C3", "C6", "C7", "C8", "C9", "C10"];
+
+        let total: u64 = combined.iter().sum();
+
+        let combined: Vec<(u64, &str)> = combined.into_iter().zip(labels.into_iter()).collect();
+
+
+        for (state, label) in combined.iter() {
+            let percent = 100.0 * (*state as f64 / total as f64);
+            println!("Package {label} : {percent:.03}% of total", )
+        }
+    }
+
     fn suspend_userspace(&mut self) {
-        let mut to_suspend = filter(read_all_procs(all_user_pids()), to_not_suspend_kws(), false);
+        self.frozen_processes = self.gather_procs();
 
-        to_suspend.append(&mut filter(
-            read_all_procs(all_system_pids()),
-            to_suspend_kws(),
-            true,
-        ));
 
-        println!("Found {} processes to freeze", to_suspend.len());
-        //println!("Process list: {to_suspend:?}");
-        //write_proc_list(&to_suspend);
-        self.frozen_processes = to_suspend.clone();
+        //self.frozen_processes.sort_by_key(|p| p.pid());
 
-        let before = Instant::now();
-        let count = to_suspend.len();
-
-        //let mut joins = Vec::new();
-        for proc in to_suspend {
-            signal(proc, Signal::SIGSTOP);
+        for proc in self.frozen_processes.iter_mut() {
+            proc.suspend();
         }
 
-        let after = Instant::now();
+        self.cstate_stats = self.get_cstate_stats();
 
-        let delta = (after - before).as_secs_f64();
-
-        println!("Freezing {count} processes took {delta} seconds");
-
-        //joins.into_iter().for_each(|o| o.join().unwrap());
+        self.cpus.superpowersave();
     }
 
     fn resume_userspace(&mut self) {
+        println!("Unfreezing {} processes", self.frozen_processes.len());
+
+        self.cpus.powersave();
+
+        let new_cstate_stats = self.get_cstate_stats();
+
         let a = Instant::now();
 
-        let mut to_resume = self.frozen_processes.clone();
-        to_resume.sort_by_key(|p| p.pid);
+        let mut pstats = Vec::new();
 
+        for proc in self.frozen_processes.iter_mut().rev() {
+            let pstat = proc.resume();
+
+            if let Some(pstat) = pstat {
+                pstats.push(pstat);
+            }
+        }
         let b = Instant::now();
 
-        println!("Unfreezing {} processes", to_resume.len());
+        self.print_proc_stats(pstats);
 
-        for proc in to_resume.into_iter().rev() {
-            signal(proc, Signal::SIGCONT);
+        println!("Unfreeze took {} seconds", (b - a).as_secs_f64());
+
+        self.print_cstate_stats(self.cstate_stats.clone(), new_cstate_stats);
+
+
+        //self.set_enabled_core_count(100);
+
+    }
+
+    fn print_proc_stats(&self, mut stats: Vec<ProcessStats>) {
+        println!("Process statistics:");
+
+        fn print_proc(s: &ProcessStats) {
+            println!("Process {} ({}) took {} utime, {} stime and had suspend state {}",
+                s.pid, s.command, s.utime, s.stime, s.was_suspended
+            );
         }
 
-        let c = Instant::now();
+        stats.sort_by_key(|p| p.stime);
 
-        println!("Load took: {}", (b - a).as_secs_f64());
-        println!("Unfreeze took: {}", (c - b).as_secs_f64());
+        println!("By stime:");
+        stats.iter().rev().take(30).for_each(|s| {
+            print_proc(s);
+        });
+
+        stats.sort_by_key(|p| p.utime);
+
+        println!("By utime:");
+        stats.iter().rev().take(30).for_each(|s| {
+            print_proc(s);
+        });
     }
 
     fn load_us_modules(&mut self) {
@@ -508,6 +857,17 @@ impl Platform {
 
     fn unload_us_modules(&mut self) {
         modprobe_on_list(modprobe_list(), false);
+    }
+
+    /// a minimum of 1 core is enabled regardless of requested count
+    fn set_enabled_core_count(&mut self, count: usize) {
+        println!("We have {} cpus available", num_cpus::get());
+        let bounded = count.max(1usize);
+
+        let bounded = bounded.min(num_cpus::get());
+
+        for idx in 0..bounded {
+        }
     }
 }
 
@@ -536,7 +896,6 @@ impl PoweredDevice for Platform {
 
     fn disable(&mut self) {
         panic!("Not applicable to platform")
-
     }
 
     fn resume(&mut self) {
@@ -549,7 +908,7 @@ impl PoweredDevice for Platform {
                 self.load_us_modules();
 
                 self.set_power(DevicePowerState::Enabled);
-            },
+            }
             _ => (),
         }
     }
@@ -565,7 +924,6 @@ impl PoweredDevice for Platform {
             }
             _ => (),
         }
-
     }
 
     fn state(&self) -> DeviceState {
@@ -738,7 +1096,8 @@ trait PoweredDevice {
         let old_state = *self.events().last().unwrap();
 
         if new_state != old_state.new {
-            self.events_mut().push(DeviceStateTransition::new(old_state.new, new_state));
+            self.events_mut()
+                .push(DeviceStateTransition::new(old_state.new, new_state));
         }
     }
 
@@ -809,7 +1168,7 @@ trait PoweredDevice {
                 DevicePowerState::PowerSave => ds.time_sleeping += dur,
                 DevicePowerState::Enabled => ds.time_active += dur,
                 DevicePowerState::Disabled => ds.time_disabled += dur,
-                _ => {},
+                _ => {}
             }
         }
 
@@ -841,7 +1200,6 @@ enum EventReason {
     #[default]
     PowerButton,
 
-
     LidOpen,
     LidClose,
 
@@ -858,8 +1216,6 @@ struct Context {
     log: Vec<Event>,
 
     statistics: Vec<BatteryStatistic>,
-
-
 }
 
 impl Context {
@@ -931,6 +1287,17 @@ fn change_vt(target: &str) {
 }
 
 fn testing() {
+    let s = std::thread::spawn(|| as_server());
+
+    as_client(EventReason::LidClose);
+
+    std::thread::sleep(Duration::from_secs(10));
+
+    as_client(EventReason::LidOpen);
+
+    as_client(EventReason::Exit);
+
+    s.join().unwrap();
     //suspend_flow();
 
     //std::thread::sleep(Duration::from_secs(3));
@@ -1036,18 +1403,22 @@ fn as_server() {
         println!("Waiting for messages...");
         //let msg: Message = rcv.recv().unwrap();
         let mut msgb = [0u8];
-        pipe.read_exact(&mut msgb).unwrap();
+        //pipe.read_exact(&mut msgb).unwrap();
         //let msg = Message::from_u8(msgb[0]);
         //let msg = EventReason::from(msgb[0]);
-        let msg: EventReason = msgb[0].try_into().unwrap();
-        println!("Got a message! Message: {msg:?}");
+        //let msg: EventReason = msgb[0].try_into().unwrap();
+        if let Ok(_) = pipe.read_exact(&mut msgb) {
+            if let Ok(msg) = msgb[0].try_into() {
+                println!("Got a message! Message: {msg:?}");
 
-        match msg {
-            EventReason::Exit => break,
-            EventReason::Check => {
-                system.print_report();
-            },
-            other => system.handle_acpi(other),
+                match msg {
+                    EventReason::Exit => break,
+                    EventReason::Check => {
+                        system.print_report();
+                    }
+                    other => system.handle_acpi(other),
+                }
+            }
         }
     }
 }
@@ -1123,8 +1494,8 @@ fn modprobe_list() -> &'static [&'static str] {
         "i2c_smbus",
         "psmouse",
         //"v4l2loopback",
-        //"dell_laptop",
-        //"dell_wmi",
+        "dell_laptop",
+        "dell_wmi",
     ]
 }
 
@@ -1134,7 +1505,6 @@ fn to_suspend_kws() -> Vec<&'static str> {
         "fwupd",
         "akonadi",
         "sidewinderd",
-
         /*
         "boltd",
         "pci_pme_list_scan",
