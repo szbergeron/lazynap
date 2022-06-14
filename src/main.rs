@@ -42,6 +42,18 @@ fn main() {
     }
 }
 
+fn format_duration(d: std::time::Duration) -> String {
+    //let dur = chrono::Duration::from_std(d).unwrap_or(chrono::Duration::min_value());
+
+    //let hours = ()
+
+
+    //todo!()
+    use hhmmss::Hhmmss;
+
+    d.hhmmssxxx()
+}
+
 struct System {
     context: Context,
     devices: Vec<Box<dyn PoweredDevice>>,
@@ -52,11 +64,31 @@ struct System {
     flags: SystemFlags,
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 struct SystemFlags {
     power_connected: bool,
     lid_closed: bool,
     sleeping: bool,
+
+    power_button_spinner: bool,
+
+    time_sleeping: Duration,
+    time_active: Duration,
+    last_sleep_event: Instant,
+}
+
+impl Default for SystemFlags {
+    fn default() -> Self {
+        Self {
+            power_connected: Default::default(),
+            lid_closed: Default::default(),
+            sleeping: Default::default(),
+            power_button_spinner: Default::default(),
+            time_sleeping: Default::default(),
+            time_active: Default::default(),
+            last_sleep_event: Instant::now(),
+        }
+    }
 }
 
 enum Data {
@@ -86,12 +118,16 @@ impl System {
     }
 
     fn power_button(&mut self) {
-        self.flags.sleeping = !self.flags.sleeping;
+        self.flags.power_button_spinner = !self.flags.power_button_spinner;
 
-        if self.flags.sleeping {
-            self.suspend();
-        } else {
-            self.resume();
+        if self.flags.power_button_spinner {
+            self.flags.sleeping = !self.flags.sleeping;
+
+            if self.flags.sleeping {
+                self.do_suspend();
+            } else {
+                self.do_resume();
+            }
         }
     }
 
@@ -99,7 +135,7 @@ impl System {
         self.flags.lid_closed = false;
 
         if self.flags.sleeping {
-            self.flags.sleeping = false;
+            //self.flags.sleeping = false;
             self.resume()
         }
     }
@@ -109,7 +145,7 @@ impl System {
 
         if !self.flags.power_connected {
             if !self.flags.sleeping {
-                self.flags.sleeping = true;
+                //self.flags.sleeping = true;
                 self.suspend();
             }
         } else {
@@ -132,6 +168,16 @@ impl System {
         }
     }
 
+    fn suspend(&mut self) {
+        self.flags.sleeping = true;
+        self.do_suspend();
+    }
+
+    fn resume(&mut self) {
+        self.flags.sleeping = false;
+        self.do_resume();
+    }
+
     fn handle_acpi(&mut self, event: EventReason) {
         use EventReason::*;
 
@@ -141,11 +187,23 @@ impl System {
             LidClose => self.lid_close(),
             PowerConnect => self.power_connect(),
             PowerDisconnect => self.power_disconnect(),
+            Suspend => self.do_suspend(),
+            Resume => self.do_resume(),
             _ => (),
         }
     }
 
-    fn suspend(&mut self) {
+    fn do_suspend(&mut self) {
+        self.flags.sleeping = true;
+
+        let last_event = self.flags.last_sleep_event;
+        let now = Instant::now();
+
+        let awake_for = now - last_event;
+
+        self.flags.time_active += awake_for;
+        self.flags.last_sleep_event = now;
+
         let start = Instant::now();
 
         for d in self.devices.iter_mut() {
@@ -186,11 +244,31 @@ impl System {
         }
     }
 
-    fn resume(&mut self) {
+    fn do_resume(&mut self) {
+        self.flags.sleeping = false;
+
+        let last_event = self.flags.last_sleep_event;
+        let now = Instant::now();
+
+        let sleeping_for = now - last_event;
+
+        self.flags.last_sleep_event = now;
+        self.flags.time_sleeping += sleeping_for;
         // unpowermanage devices in reverse suspend order, starting with platform
         for d in self.devices.iter_mut().rev() {
             d.resume(); // noop if wasn't suspended or if device couldn't block sleep
         }
+
+        println!(
+            "Device was sleeping for {} seconds",
+            sleeping_for.as_secs_f64()
+        );
+
+        println!(
+            "So far device has spent {} seconds 'resumed' and {} seconds 'suspended'",
+            format_duration(self.flags.time_active),
+            format_duration(self.flags.time_sleeping)
+        );
     }
 
     fn print_report(&mut self) {
@@ -484,9 +562,25 @@ impl FreezableProcess {
             "fwupd",
             "akonadi",
             "sidewinderd",
+            /*"NetworkManager",
+            "upowerd",
+            "systemd-timesyn",
+            "systemd-journal",*/
 
-            "NetworkManager",
-            //"upowerd",
+            /*
+            "boltd",
+            "cpuhp",
+            "polkitd",
+            "rcu",
+            "systemd-udevd",
+            "systemd",
+            "migration",
+            "dbus",
+            "iio-sensor",
+            "rtkit",
+            "idle_inject",
+            "khugepaged",
+            */
             //"khugepaged",
             //"netns",
 
@@ -494,14 +588,12 @@ impl FreezableProcess {
             //"dconf-service",
             //"iio_sensor_prox",
             //"wpa_supplicant",
-
         ]
     }
 
     pub fn continue_anyway_kws() -> &'static [&'static str] {
         &[
             //"systemd",
-
             "bash",
             "tmux",
             "asciinema",
@@ -527,11 +619,17 @@ impl FreezableProcess {
         let should = if owner < 1000 {
             // this is a root or system owned process
 
-            Self::suspend_anyway_kws().iter().find(|kw| comm.contains(*kw)).is_some()
+            Self::suspend_anyway_kws()
+                .iter()
+                .find(|kw| comm.contains(*kw))
+                .is_some()
         } else {
             // this is user owned
 
-            Self::continue_anyway_kws().iter().find(|kw| comm.contains(*kw)).is_none()
+            Self::continue_anyway_kws()
+                .iter()
+                .find(|kw| comm.contains(*kw))
+                .is_none()
         };
 
         println!("Declares {pid} {comm}: {cmdline:?} should be in suspend state {should}, it is owned by {owner}");
@@ -540,21 +638,21 @@ impl FreezableProcess {
     }
 
     pub fn suspend(&mut self) {
-        self.stats_on_freeze = self.stats();
-
         if self.should_suspend() {
             self.suspended = true;
 
             //println!("Sending {} a sigstop", self.backing_process.stat.comm);
             self.signal(Signal::SIGSTOP);
         }
+
+        self.stats_on_freeze = self.stats();
     }
 
     pub fn stats(&mut self) -> (Option<Stat>, Option<Status>) {
-            (
-                self.backing_process.stat().ok(),
-                self.backing_process.status().ok()
-            )
+        (
+            self.backing_process.stat().ok(),
+            self.backing_process.status().ok(),
+        )
     }
 
     pub fn resume(&mut self) -> Option<ProcessStats> {
@@ -569,10 +667,8 @@ impl FreezableProcess {
                     stime: new_stat.stime - old_stat.stime,
                     was_suspended: self.suspended,
                 })
-            },
-            _ => {
-                None
-            } // oh well
+            }
+            _ => None, // oh well
         };
 
         if self.suspended {
@@ -583,7 +679,6 @@ impl FreezableProcess {
         }
 
         r
-
     }
 
     fn signal(&mut self, sig: Signal) {
@@ -601,9 +696,9 @@ impl FreezableProcess {
 
 struct Cpus {
     // vec of cpu ids
-    //available: Vec<u64>,
+//available: Vec<u64>,
 
-    //enabled: Vec<u64>,
+//enabled: Vec<u64>,
 }
 
 impl Cpus {
@@ -632,7 +727,7 @@ impl Cpus {
     fn get_cpu_range(file: &str) -> Vec<usize> {
         if let Ok(contents) = std::fs::read_to_string(file) {
             for line in contents.lines() {
-                return Self::parse_range(line)
+                return Self::parse_range(line);
             }
         }
 
@@ -651,12 +746,19 @@ impl Cpus {
         for (cpid, enabled) in cpus {
             let enabled = if enabled { "1" } else { "0" };
             println!("Setting state of core {cpid} to {enabled}");
-            execute::shell(format!("echo {enabled} > /sys/devices/system/cpu/cpu{cpid}/online")).output();
+            execute::shell(format!(
+                "echo {enabled} > /sys/devices/system/cpu/cpu{cpid}/online"
+            ))
+            .output();
         }
     }
 
     fn disabled_set(&mut self) -> Vec<(usize, bool)> {
-        let mut cpus: Vec<(usize, bool)> = self.detect_available().into_iter().map(|cpid| (cpid, false)).collect();
+        let mut cpus: Vec<(usize, bool)> = self
+            .detect_available()
+            .into_iter()
+            .map(|cpid| (cpid, false))
+            .collect();
 
         cpus
     }
@@ -681,7 +783,7 @@ impl Cpus {
     }
 
     fn powersave(&mut self) {
-        self.enable_count(4);
+        self.enable_count(6);
     }
 
     fn performance(&mut self) {
@@ -727,11 +829,15 @@ impl Platform {
     }
 
     fn gather_procs(&mut self) -> Vec<FreezableProcess> {
-        let mut r: Vec<FreezableProcess> = procfs::process::all_processes().unwrap().into_iter().map(|proc| {
-            FreezableProcess::new(proc)
-        }).collect();
+        let mut r: Vec<FreezableProcess> = procfs::process::all_processes()
+            .unwrap()
+            .into_iter()
+            .map(|proc| FreezableProcess::new(proc))
+            .collect();
 
-        r.sort_by_key(|p| p.pid());
+        r.sort_by_key(|p| p.pid()); // first sort by pid to disambiguate parent-child within same jiffy
+
+        r.sort_by_key(|p| p.backing_process.stat().unwrap().starttime); // sort by start time, since pids could wrap
 
         r
     }
@@ -748,13 +854,17 @@ impl Platform {
             cf.read_to_string(&mut buf);
 
             for line in buf.lines() {
-                let num = line.split_whitespace().last().unwrap_or("0").parse().unwrap_or(0);
+                let num = line
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
 
                 build.push(num);
             }
 
             build
-
         } else {
             empty
         }
@@ -762,11 +872,7 @@ impl Platform {
 
     fn print_cstate_stats(&self, old: Vec<u64>, new: Vec<u64>) {
         println!("Cstate stats:");
-        let combined: Vec<u64> = old
-            .iter()
-            .zip(new.iter())
-            .map(|(a, b)| b - a)
-            .collect();
+        let combined: Vec<u64> = old.iter().zip(new.iter()).map(|(a, b)| b - a).collect();
 
         let labels = vec!["C2", "C3", "C6", "C7", "C8", "C9", "C10"];
 
@@ -774,32 +880,27 @@ impl Platform {
 
         let combined: Vec<(u64, &str)> = combined.into_iter().zip(labels.into_iter()).collect();
 
-
         for (state, label) in combined.iter() {
             let percent = 100.0 * (*state as f64 / total as f64);
-            println!("Package {label} : {percent:.03}% of total", )
+            println!("Package {label} : {percent:.03}% of total",)
         }
     }
 
     fn suspend_userspace(&mut self) {
         self.frozen_processes = self.gather_procs();
 
-
         //self.frozen_processes.sort_by_key(|p| p.pid());
+        self.cpus.superpowersave();
 
         for proc in self.frozen_processes.iter_mut() {
             proc.suspend();
         }
 
         self.cstate_stats = self.get_cstate_stats();
-
-        self.cpus.superpowersave();
     }
 
     fn resume_userspace(&mut self) {
         println!("Unfreezing {} processes", self.frozen_processes.len());
-
-        self.cpus.powersave();
 
         let new_cstate_stats = self.get_cstate_stats();
 
@@ -816,22 +917,23 @@ impl Platform {
         }
         let b = Instant::now();
 
+        self.cpus.powersave();
+
         self.print_proc_stats(pstats);
 
         println!("Unfreeze took {} seconds", (b - a).as_secs_f64());
 
         self.print_cstate_stats(self.cstate_stats.clone(), new_cstate_stats);
 
-
         //self.set_enabled_core_count(100);
-
     }
 
     fn print_proc_stats(&self, mut stats: Vec<ProcessStats>) {
         println!("Process statistics:");
 
         fn print_proc(s: &ProcessStats) {
-            println!("Process {} ({}) took {} utime, {} stime and had suspend state {}",
+            println!(
+                "Process {} ({}) took {} utime, {} stime and had suspend state {}",
                 s.pid, s.command, s.utime, s.stime, s.was_suspended
             );
         }
@@ -840,14 +942,18 @@ impl Platform {
 
         println!("By stime:");
         stats.iter().rev().take(30).for_each(|s| {
-            print_proc(s);
+            if s.stime > 0 {
+                print_proc(s);
+            }
         });
 
         stats.sort_by_key(|p| p.utime);
 
         println!("By utime:");
         stats.iter().rev().take(30).for_each(|s| {
-            print_proc(s);
+            if s.utime > 0 {
+                print_proc(s);
+            }
         });
     }
 
@@ -866,8 +972,7 @@ impl Platform {
 
         let bounded = bounded.min(num_cpus::get());
 
-        for idx in 0..bounded {
-        }
+        for idx in 0..bounded {}
     }
 }
 
@@ -1291,7 +1396,7 @@ fn testing() {
 
     as_client(EventReason::LidClose);
 
-    std::thread::sleep(Duration::from_secs(10));
+    std::thread::sleep(Duration::from_secs(60));
 
     as_client(EventReason::LidOpen);
 
@@ -1853,5 +1958,33 @@ fn signal(proc: Process, signal: Signal) {
         Err(v) => {
             println!("Failed to send {signal} to process {pid}: {}", v);
         }
+    }
+}
+
+mod monitoring {
+    use std::time::Duration;
+
+    /// If monitoring should be throttled/lowered,
+    /// this will be sent as an event over the info channel
+    pub enum Throttling {
+        StartThrottle,
+        EndThrottle,
+    }
+
+    pub enum MonitoringSignal {
+        Throttle(Throttling),
+    }
+
+    fn monitor(channel: std::sync::mpsc::Receiver<MonitoringSignal>) {
+        let mut poll_rate = Duration::from_secs(3);
+        let mut manager = battery::Manager::new();
+
+        let mut batt = manager
+            .unwrap()
+            .batteries()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
     }
 }
