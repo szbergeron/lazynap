@@ -1,3 +1,5 @@
+#![feature(iter_intersperse)]
+
 use battery::*;
 use procfs::process::{Stat, Status};
 use std::collections::HashMap;
@@ -10,6 +12,7 @@ use std::process::Command;
 use std::str::FromStr;
 
 use std::time::{Duration, Instant};
+
 
 use drm::control::Device;
 use ipipe::Pipe;
@@ -54,9 +57,21 @@ fn format_duration(d: std::time::Duration) -> String {
     d.hhmmssxxx()
 }
 
+fn schedule_power_check() {
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(60));
+        as_client(EventReason::DebugLowPowerStates);
+    });
+}
+
 struct System {
     context: Context,
-    devices: Vec<Box<dyn PoweredDevice>>,
+    //devices: Vec<Box<dyn PoweredDevice>>,
+    display: Display,
+    wifi: Wifi,
+    bluetooth: Bluetooth,
+    platform: Platform,
+
     battery_manager: battery::Manager,
 
     info: HashMap<String, Data>,
@@ -99,16 +114,51 @@ enum Data {
 }
 
 impl System {
+    fn on_startup(&mut self) {
+        //return;
+        // check if we need to recover from a failed suspend/resume cycle
+        // we only do this once, and delete the file, so that
+        // we don't trap ourselves in a loop
+
+        modprobe_on_list(modprobe_list(), true); // so we at least have keyboard and are relatively recoverable
+
+        let suspended_procs = std::fs::read_to_string("/tmp/suspended_procs").unwrap_or(String::default());
+        execute::shell("rm /tmp/suspended_procs").output().unwrap();
+
+        let mut pids: Vec<i32> = suspended_procs.split(",").map(|substr| substr.parse().unwrap_or(-1)).collect();
+
+        pids.sort();
+
+        // we want to iterate from highest PIDs to lowest so we don't have the "parent sees a dead
+        // child and panics" situation
+
+        for pid in pids.iter().rev() {
+            let _ = nix::sys::signal::kill(Pid::from_raw(*pid), Signal::SIGCONT);
+        }
+
+        std::thread::spawn(|| {
+            // if we're in a backpack let's try not to melt the user
+            std::thread::sleep(Duration::from_secs(10));
+
+            let state = std::fs::read_to_string("/proc/acpi/button/lid/LID0/state").unwrap();
+            if state.contains("closed") {
+                as_client(EventReason::LidClose);
+            }
+        });
+    }
+
+    fn devices(&mut self) -> Vec<&mut dyn PoweredDevice> {
+        vec![&mut self.display, &mut self.wifi, &mut self.bluetooth, &mut self.platform]
+    }
+
     fn new() -> Self {
         System {
             context: Context::default(),
             //devices: vec![Wifi::create(), Bluetooth::create(), Platform::create()],
-            devices: vec![
-                Display::create(),
-                Wifi::create(),
-                Bluetooth::create(),
-                Platform::create(),
-            ],
+            display: *Display::create(),
+            wifi: *Wifi::create(),
+            bluetooth: *Bluetooth::create(),
+            platform: *Platform::create(),
             //devices: vec![Platform::create()],
             //devices: vec![Display::create()],
             battery_manager: battery::Manager::new().unwrap(),
@@ -187,8 +237,13 @@ impl System {
             LidClose => self.lid_close(),
             PowerConnect => self.power_connect(),
             PowerDisconnect => self.power_disconnect(),
-            Suspend => self.do_suspend(),
-            Resume => self.do_resume(),
+            DebugLowPowerStates => {
+                if self.flags.sleeping {
+                    self.platform.debug_low_power();
+                }
+            }
+            /*Suspend => self.do_suspend(),
+            Resume => self.do_resume(),*/
             _ => (),
         }
     }
@@ -206,7 +261,7 @@ impl System {
 
         let start = Instant::now();
 
-        for d in self.devices.iter_mut() {
+        for d in self.devices().iter_mut() {
             d.detect();
 
             if d.should_block_sleep() {
@@ -242,6 +297,8 @@ impl System {
                 let _ = writeln!(f, "{oe}");
             }
         }
+
+        schedule_power_check()
     }
 
     fn do_resume(&mut self) {
@@ -255,7 +312,7 @@ impl System {
         self.flags.last_sleep_event = now;
         self.flags.time_sleeping += sleeping_for;
         // unpowermanage devices in reverse suspend order, starting with platform
-        for d in self.devices.iter_mut().rev() {
+        for d in self.devices().iter_mut().rev() {
             d.resume(); // noop if wasn't suspended or if device couldn't block sleep
         }
 
@@ -276,7 +333,7 @@ impl System {
             "Current power status is: {:?}",
             BatteryStatistic::collect(self.battery_manager.batteries().unwrap())
         );
-        for dev in self.devices.iter_mut() {
+        for dev in self.devices().iter_mut() {
             let rep = dev.report().unwrap();
             let devname = dev.name();
 
@@ -593,7 +650,12 @@ impl FreezableProcess {
 
     pub fn continue_anyway_kws() -> &'static [&'static str] {
         &[
-            //"systemd",
+            "pipewire",
+            "pipewire-pulse",
+            "dbus-daemon",
+            "wireplumber",
+            "systemd",
+            "sd-pam",
             "bash",
             "tmux",
             "asciinema",
@@ -643,6 +705,7 @@ impl FreezableProcess {
 
             //println!("Sending {} a sigstop", self.backing_process.stat.comm);
             self.signal(Signal::SIGSTOP);
+
         }
 
         self.stats_on_freeze = self.stats();
@@ -750,6 +813,10 @@ impl Cpus {
                 "echo {enabled} > /sys/devices/system/cpu/cpu{cpid}/online"
             ))
             .output();
+
+            execute::shell(format!(
+                    "echo 13 > /sys/devices/system/cpu/cpu{cpid}/power/energy_perf_bias"
+                )).output();
         }
     }
 
@@ -783,7 +850,7 @@ impl Cpus {
     }
 
     fn powersave(&mut self) {
-        self.enable_count(6);
+        self.enable_count(12); // just leave it, it's fine
     }
 
     fn performance(&mut self) {
@@ -842,6 +909,94 @@ impl Platform {
         r
     }
 
+    fn debug_low_power(&mut self) {
+        println!("Checking stats");
+        let sample_1 = self.get_cstate_stats();
+
+        std::thread::sleep(Duration::from_secs(2));
+
+        let sample_2 = self.get_cstate_stats();
+
+        let counts: Vec<u64> = sample_1.into_iter().zip(sample_2.into_iter()).map(|(a, b)| b - a).rev().collect();
+
+        println!("Stats in rev order: {counts:?}");
+
+        let mut counts = counts.into_iter();
+
+        let c10 = counts.next().unwrap_or(1);
+        let c9 = counts.next().unwrap_or(1);
+        let c8 = counts.next().unwrap_or(1);
+        let c7 = counts.next().unwrap_or(1);
+        let c6 = counts.next().unwrap_or(1);
+        let c3 = counts.next().unwrap_or(1);
+        let c2 = counts.next().unwrap_or(1);
+
+        if c10 > 0 {
+            // sleeping peacefully :)
+        } else if c9 > 0 {
+            println!("Got to C9 but not C10, taking corrective actions");
+            // could be that TCSS is in a bad state, try reset USB-C/USB subsystem
+            // this is likely pipewire being naughty though, so instead of trying
+            // to fully reset the usb subsystem lets just..."restart" that
+            //let _ = execute::shell("killall pipewire pipewire-pulse").output();
+            println!("Restarting pipewire because an app probably left something open (fuck you, discord)");
+            let r = execute::shell("sudo -u sawyer XDG_RUNTIME_DIR=\"/run/user/$(id -u sawyer)\" systemctl --user restart pipewire pipewire-pulse").output();
+            if let Ok(o) = r {
+                println!("Ran restart of pw, stdout:");
+                println!("{}", String::from_utf8(o.stdout).unwrap_or("not utf8".to_owned()));
+                println!("{}", String::from_utf8(o.stderr).unwrap_or("not utf8".to_owned()));
+            } else {
+                println!("Failed to restart, unknown reason");
+            }
+            //println!("Res: {}", .stdout());
+
+            /*
+             * requirements for C10:
+             *  All VRs at PS4 or LPM.
+             *  Crystal clock off.
+             *  TCSS may enter lowest power state (TC cold) 2
+             */
+            
+        } else if c8 > 0 {
+            println!("Got to C8 but not C9, taking corrective actions");
+            /*
+             * requirements for C9:
+             *  All IA cores in C9 or deeper
+             *  display in PSR or off
+             *  VCCIO stays on
+             */
+        } else if c7 > 0 {
+            println!("Got to C7 but not C8, taking corrective actions");
+            /* requirements for C8:
+             *  C8 transient, involves LLC being flushed
+             */
+        } else if c6 > 0 {
+            println!("Got to C6 but not C7, taking corrective actions");
+            /* requirements for C7:
+             *  all IA cores requested C7
+             *  graphics cores in RC6 or deeper
+             *  platform allow proper LTR
+             */
+        } else if c3 > 0 {
+            println!("Got to C3 but not C6, taking corrective actions");
+            /* requirements for C6:
+             *  IA cores in C6 or deeper, GPU cores in RC6
+             *  BCLK is off
+             *  IMVP VRs voltage reduction, PSx state possible
+             */
+        } else if c2 > 0 {
+            println!("Got to C2 but not C3, taking corrective actions");
+            // if we aren't getting deeper than this during *sleep* then realistically all hope is
+            // lost, just...don't
+        } else {
+            println!("Never left C0!");
+            // something is just eating our cpu whole and we're stuck in c0, abort??
+        }
+
+        // schedule another checkup
+        schedule_power_check();
+    }
+
     fn get_cstate_stats(&self) -> Vec<u64> {
         let empty = vec![0u64; 7];
 
@@ -892,6 +1047,13 @@ impl Platform {
         //self.frozen_processes.sort_by_key(|p| p.pid());
         self.cpus.superpowersave();
 
+        //let r = self.frozen_processes.iter().map(|p| p.pid().to_string()).intersperse(",".to_owned());
+
+        //let c: String = r.collect();
+
+        //let _ = std::fs::write("/tmp/suspended_procs", c); // don't want this to completely
+                                                           // break flow if it fails
+
         for proc in self.frozen_processes.iter_mut() {
             proc.suspend();
         }
@@ -924,6 +1086,8 @@ impl Platform {
         println!("Unfreeze took {} seconds", (b - a).as_secs_f64());
 
         self.print_cstate_stats(self.cstate_stats.clone(), new_cstate_stats);
+
+        let _ = execute::shell("rm /tmp/suspended_procs").output(); // best effort
 
         //self.set_enabled_core_count(100);
     }
@@ -1069,13 +1233,13 @@ impl PoweredDevice for Wifi {
     }
 
     fn enable(&mut self) {
-        execute::shell("nmcli radio wifi on");
+        let _ = execute::shell("nmcli radio wifi on").output();
 
         self.state.power = DevicePowerState::Enabled;
     }
 
     fn disable(&mut self) {
-        execute::shell("nmcli radio wifi off");
+        let _ = execute::shell("nmcli radio wifi off").output();
 
         self.state.power = DevicePowerState::Disabled;
     }
@@ -1129,6 +1293,16 @@ impl Bluetooth {
             log: vec![DeviceStateTransition::first()],
         })
     }
+
+    fn status() -> String {
+        if let Ok(o) = execute::shell("rfkill list bluetooth").output() {
+            if let Ok(s) = String::from_utf8(o.stdout) {
+                return s
+            }
+        }
+
+        String::from("couldn't get bt status")
+    }
 }
 
 impl PoweredDevice for Bluetooth {
@@ -1141,12 +1315,18 @@ impl PoweredDevice for Bluetooth {
     }
 
     fn enable(&mut self) {
-        execute::shell("rfkill unblock bluetooth");
+        println!("Enabling bluetooth bluetooth");
+        let _ = execute::shell("rfkill unblock bluetooth").output();
+        std::thread::sleep(Duration::from_millis(200)); // otherwise doesn't have long enough
+        println!("Status: {}", Self::status());
         self.state.power = DevicePowerState::Enabled;
     }
 
     fn disable(&mut self) {
-        execute::shell("rfkill block bluetooth");
+        println!("Disabling bluetooth");
+        let _ = execute::shell("rfkill block bluetooth").output();
+        std::thread::sleep(Duration::from_millis(200)); // otherwise doesn't have long enough
+        println!("Status: {}", Self::status());
 
         self.state.power = DevicePowerState::Disabled;
     }
@@ -1311,6 +1491,8 @@ enum EventReason {
     PowerConnect,
     PowerDisconnect,
 
+    DebugLowPowerStates,
+
     Check,
 
     Exit,
@@ -1431,9 +1613,96 @@ fn testing() {
     resume_userspace();*/
 }
 
-struct Monitors {}
+struct Monitors {
+    //dpms_handle: Option<drm::control::property::Info>,
+    dpms_handle: Option<drm::control::property::Handle>,
+    conn_handle: Option<drm::control::connector::Handle>,
+    card: Card,
+}
 
 impl Monitors {
+    fn new() -> Self {
+        let card = Card::open_global();
+
+        let mut m = Monitors {
+            card,
+            dpms_handle: None,
+            conn_handle: None,
+        };
+
+        m.refresh_dpms_info();
+
+        m
+    }
+
+    fn refresh_dpms_info(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let resources = self.card.resource_handles()?;
+
+        for conn_handle in resources.connectors() {
+            let props = self.card.get_properties(*conn_handle)?;
+            let (ids, vals) = props.as_props_and_values();
+
+            for (&id, &val) in ids.iter().zip(vals.iter()) {
+                //println!("Property: {:?}", id);
+                let info = self.card.get_property(id)?;
+                //println!("Val: {}", val);
+
+                if info.name().to_str().unwrap() == "DPMS" {
+                    println!("{:?}", info.name());
+                    println!("{:#?}", info.value_type());
+                    println!("Mutable: {}", info.mutable());
+                    println!("Atomic: {}", info.atomic());
+                    println!("Value: {:?}", info.value_type().convert_value(val));
+                    println!();
+
+                    self.dpms_handle = Some(id);
+                    self.conn_handle = Some(*conn_handle);
+
+                    //info.value_type().convert_value(val)
+                    //card.set_property(*conn_handle, id, num).unwrap();
+                    //std::thread::sleep_ms(1000);
+                    //card.set_property(*conn_handle, id, 0).unwrap();
+                    //break 'outer;
+                }
+            }
+        }
+        println!("Dpms could not be detected");
+
+        Ok(())
+    }
+
+    fn get_dpms(&self) -> DPMSState {
+        match self.conn_handle {
+            Some(v) => {
+                self.card.get_properties(v).unwrap();
+            }
+            None => {}
+        }
+
+        match self.dpms_handle {
+            Some(handle) => {
+
+                match self.card.get_property(handle) {
+                    Ok(v) => {
+                    },
+                    _ => {}
+                }
+            }
+            None => {}
+        }
+
+        DPMSState::Unknown
+    }
+
+    fn set_dpms_state(&mut self) {
+        match self.dpms_handle {
+            Some(handle) => {
+                //self.card.set_property(handle, , value)
+            },
+            None => (),
+        }
+    }
+
     fn get_dpms_status() -> std::result::Result<DPMSState, Box<dyn std::error::Error>> {
         //let card = Card
         let card = Card::open_global();
@@ -1503,6 +1772,8 @@ fn as_server() {
     let mut pipe = pipe();
 
     let mut system = System::new();
+
+    system.on_startup();
 
     loop {
         println!("Waiting for messages...");
@@ -1574,24 +1845,6 @@ fn modprobe_on_list(list: &[&str], load: bool) {
     }
 }
 
-fn wifi(enable: bool) -> Option<()> {
-    match enable {
-        true => execute::shell("nmcli radio wifi on").output().ok()?,
-        false => execute::shell("nmcli radio wifi off").output().ok()?,
-    };
-
-    Some(())
-}
-
-fn bluetooth(enable: bool) -> Option<()> {
-    match enable {
-        true => execute::shell("rfkill unblock bluetooth").output().ok()?,
-        false => execute::shell("rfkill block bluetooth").output().ok()?,
-    };
-
-    Some(())
-}
-
 fn modprobe_list() -> &'static [&'static str] {
     &[
         "i2c_hid",
@@ -1601,6 +1854,7 @@ fn modprobe_list() -> &'static [&'static str] {
         //"v4l2loopback",
         "dell_laptop",
         "dell_wmi",
+        //"bluetooth",
     ]
 }
 

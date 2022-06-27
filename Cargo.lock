@@ -311,6 +311,7 @@ dependencies = [
  "execute",
  "hhmmss",
  "ipipe",
+ "libc",
  "nix 0.24.1",
  "num_cpus",
  "num_enum",
