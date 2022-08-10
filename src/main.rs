@@ -6,13 +6,14 @@ use procfs::process::{Stat, Status};
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::fs::{self};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
 //use image::load_from_memory_with_format
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,8 @@ use drm::control::Device;
 use ipipe::Pipe;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+
+use async_trait::async_trait;
 //use rayon::prelude::*;
 //use serde::{Deserialize, Serialize};
 //use unix_ipc::{Bootstrapper, Receiver, Sender};
@@ -44,11 +47,23 @@ async fn main() {
 
             "suspend" => as_client(EventReason::Suspend),
             "resume" => as_client(EventReason::Resume),
-            "test" => testing(),
+            "test" => testing().await,
             //"test" => testing(),
             _ => {}
         }
     }
+}
+
+mod parallel {
+    enum Progress {
+        NotStarted(),
+        Starting(),
+        Done(),
+    }
+
+    enum 
+
+    pub fn announce()
 }
 
 /*mod parallel {
@@ -80,6 +95,12 @@ fn schedule_power_check() {
     });
 }
 
+/// i KNOW this is dumb, and probably unsafe,
+/// and probably a very bad idea. This is just because battery
+/// manager doesn't properly allow send itself for some godforsaken reason.
+unsafe impl Send for System {
+}
+
 struct System {
     context: Context,
     //devices: Vec<Box<dyn PoweredDevice>>,
@@ -89,7 +110,7 @@ struct System {
     bluetooth: Bluetooth,
     platform: Platform,
 
-    battery_manager: battery::Manager,
+    battery_manager: Arc<battery::Manager>,
 
     info: HashMap<String, Data>,
 
@@ -189,53 +210,53 @@ impl System {
             platform: *Platform::create(),
             //devices: vec![Platform::create()],
             //devices: vec![Display::create()],
-            battery_manager: battery::Manager::new().unwrap(),
+            battery_manager: Arc::new(battery::Manager::new().unwrap()),
             info: HashMap::new(),
             flags: Default::default(),
         }
     }
 
-    fn power_button(&mut self) {
+    async fn power_button(&mut self) {
         self.flags.power_button_spinner = !self.flags.power_button_spinner;
 
         if self.flags.power_button_spinner {
             self.flags.sleeping = !self.flags.sleeping;
 
             if self.flags.sleeping {
-                self.do_suspend();
+                self.do_suspend().await;
             } else {
-                self.do_resume();
+                self.do_resume().await;
             }
         }
     }
 
-    fn lid_open(&mut self) {
+    async fn lid_open(&mut self) {
         self.flags.lid_closed = false;
 
         if self.flags.sleeping {
             //self.flags.sleeping = false;
-            self.resume()
+            self.resume().await
         }
     }
 
-    fn lid_close(&mut self) {
+    async fn lid_close(&mut self) {
         self.flags.lid_closed = true;
 
         if !self.flags.power_connected {
             if !self.flags.sleeping {
                 //self.flags.sleeping = true;
-                self.suspend();
+                self.suspend().await;
             }
         } else {
             println!("Inhibiting sleep since power is connected")
         }
     }
 
-    fn power_connect(&mut self) {
+    async fn power_connect(&mut self) {
         self.flags.power_connected = true;
     }
 
-    fn power_disconnect(&mut self) {
+    async fn power_disconnect(&mut self) {
         self.flags.power_connected = false;
 
         // really we should only do this if we're "charged"
@@ -248,34 +269,34 @@ impl System {
         // we want system to go into suspend
         if !self.flags.sleeping && self.flags.lid_closed {
             self.flags.sleeping = true;
-            self.suspend();
+            self.suspend().await;
         }
     }
 
-    fn suspend(&mut self) {
+    async fn suspend(&mut self) {
         self.flags.sleeping = true;
-        self.do_suspend();
+        self.do_suspend().await;
     }
 
-    fn resume(&mut self) {
+    async fn resume(&mut self) {
         self.flags.sleeping = false;
-        self.do_resume();
+        self.do_resume().await;
     }
 
-    fn handle_acpi(&mut self, event: EventReason) {
+    async fn handle_acpi(&mut self, event: EventReason) {
         use EventReason::*;
 
         match event {
-            PowerButton => self.power_button(),
-            LidOpen => self.lid_open(),
-            Suspend => self.do_suspend(),
-            Resume => self.do_resume(),
-            LidClose => self.lid_close(),
-            PowerConnect => self.power_connect(),
-            PowerDisconnect => self.power_disconnect(),
+            PowerButton => self.power_button().await,
+            LidOpen => self.lid_open().await,
+            Suspend => self.do_suspend().await,
+            Resume => self.do_resume().await,
+            LidClose => self.lid_close().await,
+            PowerConnect => self.power_connect().await,
+            PowerDisconnect => self.power_disconnect().await,
             DebugLowPowerStates => {
                 if self.flags.sleeping {
-                    self.platform.debug_low_power();
+                    self.platform.debug_low_power().await;
                 }
             }
             /*Suspend => self.do_suspend(),
@@ -284,7 +305,7 @@ impl System {
         }
     }
 
-    fn do_suspend(&mut self) {
+    async fn do_suspend(&mut self) {
         self.flags.sleeping = true;
 
         let last_event = self.flags.last_sleep_event;
@@ -300,8 +321,10 @@ impl System {
         for d in self.devices().iter_mut() {
             d.detect();
 
-            if d.should_block_sleep() {
-                d.suspend();
+            let should_block = d.should_block_sleep().await;
+
+            if should_block {
+                d.suspend().await;
             }
         }
 
@@ -337,7 +360,7 @@ impl System {
         schedule_power_check()
     }
 
-    fn do_resume(&mut self) {
+    async fn do_resume(&mut self) {
         self.flags.sleeping = false;
 
         let last_event = self.flags.last_sleep_event;
@@ -349,7 +372,7 @@ impl System {
         self.flags.time_sleeping += sleeping_for;
         // unpowermanage devices in reverse suspend order, starting with platform
         for d in self.devices().iter_mut().rev() {
-            d.resume(); // noop if wasn't suspended or if device couldn't block sleep
+            d.resume().await; // noop if wasn't suspended or if device couldn't block sleep
         }
 
         println!(
@@ -547,6 +570,7 @@ impl DisplayLate {
     }
 }
 
+#[async_trait]
 impl PoweredDevice for DisplayLate {
     fn name(&self) -> &'static str {
         "display_late"
@@ -556,12 +580,12 @@ impl PoweredDevice for DisplayLate {
         ()
     }
 
-    fn enable(&mut self) {
+    async fn enable(&mut self) {
         Monitors::hold_resume_display();
         let _ = Monitors::set_dpms(DPMSState::On);
     }
 
-    fn disable(&mut self) {
+    async fn disable(&mut self) {
         let _ = Monitors::set_dpms(DPMSState::Suspend);
     }
 
@@ -569,11 +593,11 @@ impl PoweredDevice for DisplayLate {
         DeviceState::unknown()
     }
 
-    fn set_power(&mut self, state: DevicePowerState) {
+    async fn set_power(&mut self, state: DevicePowerState) {
         ()
     }
 
-    fn should_block_sleep(&self) -> bool {
+    async fn should_block_sleep(&self) -> bool {
         true
     }
 
@@ -643,6 +667,7 @@ impl Display {
     }
 }
 
+#[async_trait]
 impl PoweredDevice for Display {
     fn events(&self) -> &[DeviceStateTransition] {
         self.log.as_slice()
@@ -652,14 +677,14 @@ impl PoweredDevice for Display {
         &mut self.log
     }
 
-    fn enable(&mut self) {
+    async fn enable(&mut self) {
         // don't do anything here :)
         self.unblank();
 
         self.state.power = DevicePowerState::Enabled;
     }
 
-    fn disable(&mut self) {
+    async fn disable(&mut self) {
         self.active_tty = Self::active_tty();
 
         //lock_blank_screen();
@@ -675,11 +700,11 @@ impl PoweredDevice for Display {
         self.state
     }
 
-    fn set_power(&mut self, state: DevicePowerState) {
+    async fn set_power(&mut self, state: DevicePowerState) {
         self.state.power = state;
     }
 
-    fn should_block_sleep(&self) -> bool {
+    async fn should_block_sleep(&self) -> bool {
         true
     }
 
@@ -982,7 +1007,7 @@ impl Cpus {
     }
 
     fn disabled_set(&mut self) -> Vec<(usize, bool)> {
-        let mut cpus: Vec<(usize, bool)> = self
+        let cpus: Vec<(usize, bool)> = self
             .detect_available()
             .into_iter()
             .map(|cpid| (cpid, false))
@@ -1007,7 +1032,7 @@ impl Cpus {
     fn superpowersave(&mut self) {
         // we will enable a single core
 
-        self.enable_count(1);
+        self.enable_count(3);
     }
 
     fn powersave(&mut self) {
@@ -1070,7 +1095,7 @@ impl Platform {
         r
     }
 
-    fn debug_low_power(&mut self) {
+    async fn debug_low_power(&mut self) {
         println!("Checking stats");
         let sample_1 = self.get_cstate_stats();
 
@@ -1359,6 +1384,7 @@ impl Platform {
     }
 }
 
+#[async_trait]
 impl PoweredDevice for Platform {
     fn name(&self) -> &'static str {
         "platform"
@@ -1378,15 +1404,15 @@ impl PoweredDevice for Platform {
         self.handle_detect(self.state());
     }
 
-    fn enable(&mut self) {
+    async fn enable(&mut self) {
         panic!("Not applicable to platform")
     }
 
-    fn disable(&mut self) {
+    async fn disable(&mut self) {
         panic!("Not applicable to platform")
     }
 
-    fn resume(&mut self) {
+    async fn resume(&mut self) {
         // we can unconditionally resume since
         // sending sigcont and doing modprobes is idempotent
         match self.state().power {
@@ -1395,20 +1421,20 @@ impl PoweredDevice for Platform {
 
                 self.load_us_modules();
 
-                self.set_power(DevicePowerState::Enabled);
+                self.set_power(DevicePowerState::Enabled).await;
             }
             _ => (),
         }
     }
 
-    fn suspend(&mut self) {
+    async fn suspend(&mut self) {
         match self.state().power {
             DevicePowerState::Enabled => {
                 self.unload_us_modules();
 
                 self.suspend_userspace();
 
-                self.set_power(DevicePowerState::PowerSave);
+                self.set_power(DevicePowerState::PowerSave).await;
             }
             _ => (),
         }
@@ -1418,11 +1444,11 @@ impl PoweredDevice for Platform {
         self.state
     }
 
-    fn set_power(&mut self, state: DevicePowerState) {
+    async fn set_power(&mut self, state: DevicePowerState) {
         self.state.power = state;
     }
 
-    fn should_block_sleep(&self) -> bool {
+    async fn should_block_sleep(&self) -> bool {
         true
     }
 }
@@ -1442,6 +1468,7 @@ impl Wifi {
     }
 }
 
+#[async_trait]
 impl PoweredDevice for Wifi {
     fn events(&self) -> &[DeviceStateTransition] {
         self.log.as_slice()
@@ -1451,13 +1478,13 @@ impl PoweredDevice for Wifi {
         &mut self.log
     }
 
-    fn enable(&mut self) {
+    async fn enable(&mut self) {
         let _ = execute::shell("nmcli radio wifi on").output();
 
         self.state.power = DevicePowerState::Enabled;
     }
 
-    fn disable(&mut self) {
+    async fn disable(&mut self) {
         let _ = execute::shell("nmcli radio wifi off").output();
 
         self.state.power = DevicePowerState::Disabled;
@@ -1467,11 +1494,11 @@ impl PoweredDevice for Wifi {
         self.state
     }
 
-    fn set_power(&mut self, state: DevicePowerState) {
+    async fn set_power(&mut self, state: DevicePowerState) {
         self.state.power = state;
     }
 
-    fn should_block_sleep(&self) -> bool {
+    async fn should_block_sleep(&self) -> bool {
         true
     }
 
@@ -1524,6 +1551,7 @@ impl Bluetooth {
     }
 }
 
+#[async_trait]
 impl PoweredDevice for Bluetooth {
     fn events(&self) -> &[DeviceStateTransition] {
         self.log.as_slice()
@@ -1533,7 +1561,7 @@ impl PoweredDevice for Bluetooth {
         &mut self.log
     }
 
-    fn enable(&mut self) {
+    async fn enable(&mut self) {
         println!("Enabling bluetooth bluetooth");
         let _ = execute::shell("rfkill unblock bluetooth").output();
         std::thread::sleep(Duration::from_millis(200)); // otherwise doesn't have long enough
@@ -1541,7 +1569,7 @@ impl PoweredDevice for Bluetooth {
         self.state.power = DevicePowerState::Enabled;
     }
 
-    fn disable(&mut self) {
+    async fn disable(&mut self) {
         println!("Disabling bluetooth");
         let _ = execute::shell("rfkill block bluetooth").output();
         std::thread::sleep(Duration::from_millis(200)); // otherwise doesn't have long enough
@@ -1554,11 +1582,11 @@ impl PoweredDevice for Bluetooth {
         self.state
     }
 
-    fn set_power(&mut self, state: DevicePowerState) {
+    async fn set_power(&mut self, state: DevicePowerState) {
         self.state.power = state;
     }
 
-    fn should_block_sleep(&self) -> bool {
+    async fn should_block_sleep(&self) -> bool {
         true
     }
 
@@ -1588,8 +1616,8 @@ impl PoweredDevice for Bluetooth {
         "bluetooth"
     }
 }
-
-trait PoweredDevice {
+#[async_trait]
+trait PoweredDevice: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Poll device state and update internal
@@ -1605,11 +1633,11 @@ trait PoweredDevice {
         }
     }
 
-    fn suspend(&mut self) {
+    async fn suspend(&mut self) {
         let state_before = self.state().power;
 
         println!("Disabling device by name {}", self.name());
-        self.disable();
+        self.disable().await;
 
         let power = match state_before {
             DevicePowerState::Enabled => DevicePowerState::PowerSave,
@@ -1618,16 +1646,16 @@ trait PoweredDevice {
             DevicePowerState::Unknown => DevicePowerState::Unknown,
         };
 
-        self.set_power(power);
+        self.set_power(power).await;
 
         self.handle_detect(self.state());
     }
 
-    fn resume(&mut self) {
+    async fn resume(&mut self) {
         match self.state().power {
             DevicePowerState::PowerSave => {
                 println!("Resume calls enable for {}", self.name());
-                self.enable();
+                self.enable().await;
             }
             _ => (),
         }
@@ -1635,15 +1663,15 @@ trait PoweredDevice {
         self.handle_detect(self.state());
     }
 
-    fn enable(&mut self);
-    fn disable(&mut self);
+    async fn enable(&mut self);
+    async fn disable(&mut self);
 
     fn state(&self) -> DeviceState;
-    fn set_power(&mut self, state: DevicePowerState);
+    async fn set_power(&mut self, state: DevicePowerState);
 
     /// If this device should be disabled or power saved
     /// before sleep, this returns true
-    fn should_block_sleep(&self) -> bool;
+    async fn should_block_sleep(&self) -> bool;
 
     fn events_mut(&mut self) -> &mut Vec<DeviceStateTransition>;
 
@@ -1652,9 +1680,9 @@ trait PoweredDevice {
     fn report(&mut self) -> Option<DeviceStatistic> {
         self.detect();
 
-        let mut events = self.events().iter();
+        let events: Vec<DeviceStateTransition> = self.events().iter().cloned().collect();
 
-        let mut prior = events.next().unwrap();
+        let prior = events.first().cloned().unwrap();
 
         let mut ds = DeviceStatistic::default();
 
@@ -1795,8 +1823,14 @@ fn change_vt(target: &str) {
         .unwrap();
 }
 
-fn testing() {
-    let s = std::thread::spawn(|| as_server());
+async fn testing() {
+    //let s = std::thread::spawn(|| as_server().await);
+    //let s = tokio::spawn(async { as_server().await });
+
+    let s = std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        rt.spawn(as_server());
+    });
 
     as_client(EventReason::LidClose);
 
@@ -1805,6 +1839,8 @@ fn testing() {
     as_client(EventReason::LidOpen);
 
     as_client(EventReason::Exit);
+
+    //s.await.unwrap();
 
     s.join().unwrap();
     //suspend_flow();
@@ -1843,7 +1879,7 @@ struct Monitors {
 }
 
 impl Monitors {
-    fn new() -> Self {
+    async fn new() -> Self {
         let card = Card::open_global();
 
         let mut m = Monitors {
@@ -1852,12 +1888,12 @@ impl Monitors {
             conn_handle: None,
         };
 
-        m.refresh_dpms_info();
+        let _ = m.refresh_dpms_info().await;
 
         m
     }
 
-    fn refresh_dpms_info(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    async fn refresh_dpms_info(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let resources = self.card.resource_handles()?;
 
         for conn_handle in resources.connectors() {
@@ -2039,8 +2075,10 @@ impl Monitors {
         loop {
             if freed.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep_ms(100);
+                //tokio::time::sleep(Duration::from_millis(100)).await;
                 break;
             } else {
+                //tokio::time::sleep(Duration::from_millis(1000)).await;
                 std::thread::sleep_ms(1000);
             }
         }
@@ -2073,7 +2111,7 @@ impl Monitors {
                         DPMSState::Unknown => return Err("had unknown dpms state!".into()),
                     };
 
-                    card.set_property(*conn_handle, id, num);
+                    let _ = card.set_property(*conn_handle, id, num);
                 }
             }
         }
@@ -2172,7 +2210,7 @@ async fn as_server() {
                     EventReason::Check => {
                         system.print_report();
                     }
-                    other => system.handle_acpi(other),
+                    other => system.handle_acpi(other).await,
                 }
             }
         }
@@ -2188,7 +2226,7 @@ fn lock_blank_screen_gnome() {
 
 fn lock_blank_screen_2() {}
 
-fn lock_blank_screen() {
+async fn lock_blank_screen() {
     for _i in 0..10 {
         lock_blank_screen_gnome();
 
@@ -2488,10 +2526,10 @@ mod monitoring {
     }
 
     fn monitor(channel: std::sync::mpsc::Receiver<MonitoringSignal>) {
-        let mut poll_rate = Duration::from_secs(3);
-        let mut manager = battery::Manager::new();
+        let poll_rate = Duration::from_secs(3);
+        let manager = battery::Manager::new();
 
-        let mut batt = manager
+        let batt = manager
             .unwrap()
             .batteries()
             .unwrap()
