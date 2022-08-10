@@ -1,6 +1,7 @@
 #![feature(iter_intersperse)]
 
 use battery::*;
+use image::imageops;
 use procfs::process::{Stat, Status};
 use std::collections::HashMap;
 use std::env;
@@ -10,9 +11,10 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::str::FromStr;
+//use image::load_from_memory_with_format
 
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
-
 
 use drm::control::Device;
 use ipipe::Pipe;
@@ -23,7 +25,8 @@ use nix::unistd::Pid;
 //use unix_ipc::{Bootstrapper, Receiver, Sender};
 //use drm
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args: Vec<_> = env::args().collect();
 
     for a in args {
@@ -33,11 +36,14 @@ fn main() {
             "power_connect" => as_client(EventReason::PowerConnect),
             "power_disconnect" => as_client(EventReason::PowerDisconnect),
             "power_button" => as_client(EventReason::PowerButton),
-            "server" => as_server(),
+            "server" => as_server().await,
             "dpms_check" => {
                 println!("DPMS status: {:?}", Monitors::get_dpms_status());
             }
             "check" => as_client(EventReason::Check),
+
+            "suspend" => as_client(EventReason::Suspend),
+            "resume" => as_client(EventReason::Resume),
             "test" => testing(),
             //"test" => testing(),
             _ => {}
@@ -45,11 +51,21 @@ fn main() {
     }
 }
 
+/*mod parallel {
+    struct Command {
+        primary: String,
+    }
+
+    pub fn create<T>(channel_name: &'static str) {
+    }
+
+    pub fn send<T>
+}*/
+
 fn format_duration(d: std::time::Duration) -> String {
     //let dur = chrono::Duration::from_std(d).unwrap_or(chrono::Duration::min_value());
 
     //let hours = ()
-
 
     //todo!()
     use hhmmss::Hhmmss;
@@ -59,7 +75,7 @@ fn format_duration(d: std::time::Duration) -> String {
 
 fn schedule_power_check() {
     std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(60));
+        std::thread::sleep(Duration::from_secs(600));
         as_client(EventReason::DebugLowPowerStates);
     });
 }
@@ -68,6 +84,7 @@ struct System {
     context: Context,
     //devices: Vec<Box<dyn PoweredDevice>>,
     display: Display,
+    display_late: DisplayLate,
     wifi: Wifi,
     bluetooth: Bluetooth,
     platform: Platform,
@@ -84,7 +101,7 @@ struct SystemFlags {
     power_connected: bool,
     lid_closed: bool,
     sleeping: bool,
-
+    //deep_sleeping: bool,
     power_button_spinner: bool,
 
     time_sleeping: Duration,
@@ -122,10 +139,14 @@ impl System {
 
         modprobe_on_list(modprobe_list(), true); // so we at least have keyboard and are relatively recoverable
 
-        let suspended_procs = std::fs::read_to_string("/tmp/suspended_procs").unwrap_or(String::default());
+        let suspended_procs =
+            std::fs::read_to_string("/tmp/suspended_procs").unwrap_or(String::default());
         execute::shell("rm /tmp/suspended_procs").output().unwrap();
 
-        let mut pids: Vec<i32> = suspended_procs.split(",").map(|substr| substr.parse().unwrap_or(-1)).collect();
+        let mut pids: Vec<i32> = suspended_procs
+            .split(",")
+            .map(|substr| substr.parse().unwrap_or(-1))
+            .collect();
 
         pids.sort();
 
@@ -148,7 +169,13 @@ impl System {
     }
 
     fn devices(&mut self) -> Vec<&mut dyn PoweredDevice> {
-        vec![&mut self.display, &mut self.wifi, &mut self.bluetooth, &mut self.platform]
+        vec![
+            &mut self.wifi,
+            &mut self.bluetooth,
+            &mut self.display,
+            &mut self.platform,
+            &mut self.display_late,
+        ]
     }
 
     fn new() -> Self {
@@ -156,6 +183,7 @@ impl System {
             context: Context::default(),
             //devices: vec![Wifi::create(), Bluetooth::create(), Platform::create()],
             display: *Display::create(),
+            display_late: *DisplayLate::create(),
             wifi: *Wifi::create(),
             bluetooth: *Bluetooth::create(),
             platform: *Platform::create(),
@@ -210,6 +238,12 @@ impl System {
     fn power_disconnect(&mut self) {
         self.flags.power_connected = false;
 
+        // really we should only do this if we're "charged"
+        if true {
+            self.flags.time_active = Duration::ZERO;
+            self.flags.time_sleeping = Duration::ZERO;
+        }
+
         // If we're disconnecting power and the lid is shut,
         // we want system to go into suspend
         if !self.flags.sleeping && self.flags.lid_closed {
@@ -234,6 +268,8 @@ impl System {
         match event {
             PowerButton => self.power_button(),
             LidOpen => self.lid_open(),
+            Suspend => self.do_suspend(),
+            Resume => self.do_resume(),
             LidClose => self.lid_close(),
             PowerConnect => self.power_connect(),
             PowerDisconnect => self.power_disconnect(),
@@ -499,9 +535,63 @@ impl DeviceStateTransition {
 }
 
 #[derive(Debug, Clone)]
+struct DisplayLate {
+    log: Vec<DeviceStateTransition>,
+}
+
+impl DisplayLate {
+    fn create() -> Box<Self> {
+        Box::new(Self {
+            log: vec![DeviceStateTransition::first()],
+        })
+    }
+}
+
+impl PoweredDevice for DisplayLate {
+    fn name(&self) -> &'static str {
+        "display_late"
+    }
+
+    fn detect(&mut self) {
+        ()
+    }
+
+    fn enable(&mut self) {
+        Monitors::hold_resume_display();
+        let _ = Monitors::set_dpms(DPMSState::On);
+    }
+
+    fn disable(&mut self) {
+        let _ = Monitors::set_dpms(DPMSState::Suspend);
+    }
+
+    fn state(&self) -> DeviceState {
+        DeviceState::unknown()
+    }
+
+    fn set_power(&mut self, state: DevicePowerState) {
+        ()
+    }
+
+    fn should_block_sleep(&self) -> bool {
+        true
+    }
+
+    fn events_mut(&mut self) -> &mut Vec<DeviceStateTransition> {
+        &mut self.log
+    }
+
+    fn events(&self) -> &[DeviceStateTransition] {
+        &self.log
+    }
+}
+
+#[derive(Debug, Clone)]
 struct Display {
     state: DeviceState,
     log: Vec<DeviceStateTransition>,
+
+    active_tty: String,
 }
 
 impl Display {
@@ -509,7 +599,47 @@ impl Display {
         Box::new(Self {
             state: DeviceState::present_on(),
             log: vec![DeviceStateTransition::first()],
+            active_tty: Self::active_tty(),
         })
+    }
+
+    fn active_tty() -> String {
+        /*let num = String::from_utf8(execute::shell("tty").output().unwrap().stdout).unwrap();
+        let num = num.split("/").collect::<Vec<&str>>().into_iter().rev().next().unwrap();
+
+        let ret = format!("tty{num}");*/
+
+        let output = execute::shell("cat /sys/devices/virtual/tty/tty0/active").output();
+
+        String::from_utf8(output.map(|o| o.stdout).unwrap_or(vec![])).unwrap_or("tty2".into())
+    }
+
+    fn unblank(&mut self) {
+        println!("unblanking to: {}", self.active_tty);
+
+
+        //let _ = Monitors::set_dpms(DPMSState::On);
+
+        //std::thread::sleep_ms(500);
+        //std::thread::sleep_ms(30);
+
+        println!("switching back to original tty");
+        change_vt(&self.active_tty);
+        println!("done switch");
+    }
+
+    fn blank(&mut self) {
+        println!("switching to new vt");
+        //let _ = execute::shell("openvt --switch bash").output();
+        //execute::shell("openvt --switch \"echo 0 > /sys/class/graphics/fbcon/cursor_blink && bash\"");
+        let _ = execute::shell("echo 0 > /sys/class/graphics/fbcon/cursor_blink").output();
+        let _ = execute::shell("openvt --switch bash").output();
+        println!("blanking");
+
+        //let _ = Monitors::hold_resume_display();
+
+        //let _ = Monitors::set_dpms(DPMSState::Suspend);
+        //let _ = execute::shell("setterm --blank 0 --powerdown 0").output();
     }
 }
 
@@ -524,12 +654,17 @@ impl PoweredDevice for Display {
 
     fn enable(&mut self) {
         // don't do anything here :)
+        self.unblank();
 
         self.state.power = DevicePowerState::Enabled;
     }
 
     fn disable(&mut self) {
-        lock_blank_screen();
+        self.active_tty = Self::active_tty();
+
+        //lock_blank_screen();
+
+        self.blank();
 
         std::thread::sleep(Duration::from_secs(2));
 
@@ -613,12 +748,38 @@ impl FreezableProcess {
         self.backing_process.pid()
     }
 
+    pub fn powernap_list() -> &'static [&'static str] {
+        &[
+            "upowerd",
+            "systemd-journal",
+            "khugepaged",
+            "systemd-logind",
+            "sot",
+        ]
+    }
+
+    pub fn should_powernap(&mut self) -> bool {
+        let comm = self.backing_process.stat.comm.as_str();
+        let owner = self.backing_process.owner;
+        let cmdline = self.backing_process.cmdline().unwrap_or(Vec::new());
+        let cmdline = cmdline.as_slice();
+        let pid = self.pid();
+
+        Self::powernap_list()
+            .iter()
+            .find(|kw| comm.contains(*kw))
+            .is_some()
+            && !self.suspended
+    }
+
     pub fn suspend_anyway_kws() -> &'static [&'static str] {
         &[
             "evolution",
             "fwupd",
             "akonadi",
             "sidewinderd",
+            "mozillavpn",
+            "upowerd",
             /*"NetworkManager",
             "upowerd",
             "systemd-timesyn",
@@ -705,7 +866,6 @@ impl FreezableProcess {
 
             //println!("Sending {} a sigstop", self.backing_process.stat.comm);
             self.signal(Signal::SIGSTOP);
-
         }
 
         self.stats_on_freeze = self.stats();
@@ -759,9 +919,9 @@ impl FreezableProcess {
 
 struct Cpus {
     // vec of cpu ids
-//available: Vec<u64>,
+    //available: Vec<u64>,
 
-//enabled: Vec<u64>,
+    //enabled: Vec<u64>,
 }
 
 impl Cpus {
@@ -809,14 +969,15 @@ impl Cpus {
         for (cpid, enabled) in cpus {
             let enabled = if enabled { "1" } else { "0" };
             println!("Setting state of core {cpid} to {enabled}");
-            execute::shell(format!(
+            let _ = execute::shell(format!(
                 "echo {enabled} > /sys/devices/system/cpu/cpu{cpid}/online"
             ))
             .output();
 
-            execute::shell(format!(
-                    "echo 13 > /sys/devices/system/cpu/cpu{cpid}/power/energy_perf_bias"
-                )).output();
+            let _ = execute::shell(format!(
+                "echo 15 > /sys/devices/system/cpu/cpu{cpid}/power/energy_perf_bias"
+            ))
+            .output();
         }
     }
 
@@ -917,7 +1078,12 @@ impl Platform {
 
         let sample_2 = self.get_cstate_stats();
 
-        let counts: Vec<u64> = sample_1.into_iter().zip(sample_2.into_iter()).map(|(a, b)| b - a).rev().collect();
+        let counts: Vec<u64> = sample_1
+            .into_iter()
+            .zip(sample_2.into_iter())
+            .map(|(a, b)| b - a)
+            .rev()
+            .collect();
 
         println!("Stats in rev order: {counts:?}");
 
@@ -943,8 +1109,14 @@ impl Platform {
             let r = execute::shell("sudo -u sawyer XDG_RUNTIME_DIR=\"/run/user/$(id -u sawyer)\" systemctl --user restart pipewire pipewire-pulse").output();
             if let Ok(o) = r {
                 println!("Ran restart of pw, stdout:");
-                println!("{}", String::from_utf8(o.stdout).unwrap_or("not utf8".to_owned()));
-                println!("{}", String::from_utf8(o.stderr).unwrap_or("not utf8".to_owned()));
+                println!(
+                    "{}",
+                    String::from_utf8(o.stdout).unwrap_or("not utf8".to_owned())
+                );
+                println!(
+                    "{}",
+                    String::from_utf8(o.stderr).unwrap_or("not utf8".to_owned())
+                );
             } else {
                 println!("Failed to restart, unknown reason");
             }
@@ -956,9 +1128,8 @@ impl Platform {
              *  Crystal clock off.
              *  TCSS may enter lowest power state (TC cold) 2
              */
-            
         } else if c8 > 0 {
-            println!("Got to C8 but not C9, taking corrective actions");
+            println!("Got to C8 but not C9, will measure again, this is...strange");
             /*
              * requirements for C9:
              *  All IA cores in C9 or deeper
@@ -983,18 +1154,46 @@ impl Platform {
              *  IA cores in C6 or deeper, GPU cores in RC6
              *  BCLK is off
              *  IMVP VRs voltage reduction, PSx state possible
+             *
+             *  try to wrest anything using GPU away from it?
+             *  Likely GDM is in a weird state here unless something
+             *  was between transactions. Try just retrying sleep cycle?
              */
+            //self.async_resume_suspend_cycle(10);
+
+            // for some reason adb sometimes gets us stuck in this state
+            //let r = execute::shell("sudo adb kill-server").output();
         } else if c2 > 0 {
             println!("Got to C2 but not C3, taking corrective actions");
             // if we aren't getting deeper than this during *sleep* then realistically all hope is
             // lost, just...don't
+            //self.async_resume_suspend_cycle(10);
         } else {
             println!("Never left C0!");
             // something is just eating our cpu whole and we're stuck in c0, abort??
         }
 
+        if c10 < 1 {
+            println!("Doing uniform tasks to try to recover things");
+
+            println!("Restarting pipewire because an app probably left something open (fuck you, discord)");
+            let _r = execute::shell("sudo -u sawyer XDG_RUNTIME_DIR=\"/run/user/$(id -u sawyer)\" systemctl --user restart pipewire pipewire-pulse").output();
+
+            let _r = execute::shell("killall adb");
+        }
+
         // schedule another checkup
         schedule_power_check();
+    }
+
+    fn async_resume_suspend_cycle(&self, seconds: u64) {
+        std::thread::spawn(move || {
+            as_client(EventReason::Resume);
+            std::thread::sleep(Duration::from_secs(seconds));
+            let _ = execute::shell("notify-send 'force gdm to wake for a moment'").output();
+            std::thread::sleep(Duration::from_secs(1));
+            as_client(EventReason::Suspend);
+        });
     }
 
     fn get_cstate_stats(&self) -> Vec<u64> {
@@ -1006,7 +1205,7 @@ impl Platform {
             let mut build = Vec::new();
             let mut buf = String::new();
 
-            cf.read_to_string(&mut buf);
+            let _ = cf.read_to_string(&mut buf);
 
             for line in buf.lines() {
                 let num = line
@@ -1018,6 +1217,8 @@ impl Platform {
 
                 build.push(num);
             }
+            //cf.
+            //cf.close();
 
             build
         } else {
@@ -1041,6 +1242,16 @@ impl Platform {
         }
     }
 
+    /// Allows going into an even deeper sleep,
+    /// where we suspend things like journald
+    /// and upowerd even though other
+    /// parts of this script rely on them
+    fn powernap_for(&mut self, time: Duration) {
+        let to_freeze = self.gather_procs();
+
+        for proc in to_freeze {}
+    }
+
     fn suspend_userspace(&mut self) {
         self.frozen_processes = self.gather_procs();
 
@@ -1052,7 +1263,7 @@ impl Platform {
         //let c: String = r.collect();
 
         //let _ = std::fs::write("/tmp/suspended_procs", c); // don't want this to completely
-                                                           // break flow if it fails
+        // break flow if it fails
 
         for proc in self.frozen_processes.iter_mut() {
             proc.suspend();
@@ -1126,7 +1337,15 @@ impl Platform {
     }
 
     fn unload_us_modules(&mut self) {
-        modprobe_on_list(modprobe_list(), false);
+        modprobe_on_list(
+            modprobe_list()
+                .iter()
+                .rev()
+                .map(|e| *e)
+                .collect::<Vec<&str>>()
+                .as_slice(),
+            false,
+        );
     }
 
     /// a minimum of 1 core is enabled regardless of requested count
@@ -1297,7 +1516,7 @@ impl Bluetooth {
     fn status() -> String {
         if let Ok(o) = execute::shell("rfkill list bluetooth").output() {
             if let Ok(s) = String::from_utf8(o.stdout) {
-                return s
+                return s;
             }
         }
 
@@ -1487,6 +1706,9 @@ enum EventReason {
 
     LidOpen,
     LidClose,
+
+    Suspend,
+    Resume,
 
     PowerConnect,
     PowerDisconnect,
@@ -1680,27 +1902,183 @@ impl Monitors {
         }
 
         match self.dpms_handle {
-            Some(handle) => {
-
-                match self.card.get_property(handle) {
-                    Ok(v) => {
-                    },
-                    _ => {}
-                }
-            }
+            Some(handle) => match self.card.get_property(handle) {
+                Ok(v) => {}
+                _ => {}
+            },
             None => {}
         }
 
         DPMSState::Unknown
     }
 
-    fn set_dpms_state(&mut self) {
+    /*fn set_dpms_state(&mut self) {
         match self.dpms_handle {
             Some(handle) => {
                 //self.card.set_property(handle, , value)
-            },
+                self.card.set_property(handle, prop, value)
+
+            }
             None => (),
         }
+    }*/
+
+    pub fn load_image(path: &str) -> image::RgbaImage {
+        //let path = format!("examples/images/{}", name);
+
+        image::open(path).unwrap().to_rgba8()
+    }
+
+    fn hold_resume_display() {
+        std::thread::spawn(|| {
+            let cond = AtomicBool::new(false);
+            let _ = Self::set_resume_display(&cond);
+        });
+    }
+
+    fn set_resume_display(freed: &AtomicBool) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use drm::buffer::DrmFourcc;
+        use drm::control::{connector, crtc};
+
+        let card = Card::open_global();
+
+        // Load the information.
+        let res = card.resource_handles()?;
+        //.expect("Could not load normal resource ids.");
+        let coninfo: Vec<connector::Info> = res
+            .connectors()
+            .iter()
+            .flat_map(|con| card.get_connector(*con))
+            .collect();
+        let crtcinfo: Vec<crtc::Info> = res
+            .crtcs()
+            .iter()
+            .flat_map(|crtc| card.get_crtc(*crtc))
+            .collect();
+
+        // Filter each connector until we find one that's connected.
+        let con = coninfo
+            .iter()
+            .find(|&i| i.state() == connector::State::Connected)
+            .ok_or::<Box<dyn std::error::Error>>("no connected connectors".into())?;
+        //.expect("No connected connectors");
+
+        // Get the first (usually best) mode
+        let &mode = con
+            .modes()
+            .get(0)
+            .ok_or::<Box<dyn std::error::Error>>("No modes found on connector".into())?; //.expect("No modes found on connector");
+
+        let (disp_width, disp_height) = mode.size();
+
+        // Find a crtc and FB
+        let crtc = crtcinfo.get(0) //.expect("No crtcs found");
+            .ok_or::<Box<dyn std::error::Error>>("No crtcs found".into())?; //.expect("No modes found on connector");
+
+        // Select the pixel format
+        let fmt = DrmFourcc::Xrgb8888;
+
+        // Create a DB
+        // If buffer resolution is larger than display resolution, an ENOSPC (not enough video memory)
+        // error may occur
+        let mut db = card.create_dumb_buffer((disp_width.into(), disp_height.into()), fmt, 32)?;
+        //.expect("Could not create dumb buffer");
+
+        // Map it and grey it out.
+        {
+            let mut map = card.map_dumb_buffer(&mut db)?;
+            //.expect("Could not map dumbbuffer");
+
+            let img = Self::load_image("/home/sawyer/default.png");
+            let img = imageops::resize(
+                &img,
+                disp_width as u32,
+                disp_height as u32,
+                imageops::FilterType::Triangle,
+            );
+
+            let pixels = img.pixels();
+
+            let buffer = map.as_mut();
+
+            println!("disp dims: {disp_width}, {disp_height}");
+            println!("Image dims: {}, {}", img.width(), img.height());
+
+            for (img_px, map_px) in img.pixels().zip(buffer.chunks_exact_mut(4)) {
+                // Assuming little endian, it's BGRA
+                map_px[0] = img_px[2]; // Blue
+                map_px[1] = img_px[1]; // Green
+                map_px[2] = img_px[0]; // Red
+                map_px[3] = img_px[3]; // Alpha
+            }
+
+            /*for b in map.as_mut().iter_mut().enumerate() {
+            }*/
+            /*for b in map.as_mut() {
+                *b = 128;
+            }*/
+        }
+
+        // Create an FB:
+        let fb = card.add_framebuffer(&db, 24, 32)?;
+        //.expect("Could not create FB");
+
+        println!("{:#?}", mode);
+        println!("{:#?}", fb);
+        println!("{:#?}", db);
+
+        // Set the crtc
+        // On many setups, this requires root access.
+        card.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))?;
+        //.expect("Could not set CRTC");
+
+        //let five_seconds = ::std::time::Duration::from_millis(5000);
+        //::std::thread::sleep(five_seconds);
+        //std::thread::sleep_ms(700);
+
+        loop {
+            if freed.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep_ms(100);
+                break;
+            } else {
+                std::thread::sleep_ms(1000);
+            }
+        }
+
+        //card.destroy_framebuffer(fb).unwrap();
+        //card.destroy_dumb_buffer(db).unwrap();
+
+        Ok(())
+    }
+
+    fn set_dpms(state: DPMSState) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let card = Card::open_global();
+        let resources = card.resource_handles()?;
+
+        for conn_handle in resources.connectors() {
+            let props = card.get_properties(*conn_handle)?;
+            let (ids, vals) = props.as_props_and_values();
+
+            for (&id, &val) in ids.iter().zip(vals.iter()) {
+                //println!("Property: {:?}", id);
+                let info = card.get_property(id)?;
+                //println!("Val: {}", val);
+
+                if info.name().to_str().unwrap() == "DPMS" {
+                    let num = match state {
+                        DPMSState::On => 0,
+                        DPMSState::Standby => 1,
+                        DPMSState::Suspend => 2,
+                        DPMSState::Off => 3,
+                        DPMSState::Unknown => return Err("had unknown dpms state!".into()),
+                    };
+
+                    card.set_property(*conn_handle, id, num);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn get_dpms_status() -> std::result::Result<DPMSState, Box<dyn std::error::Error>> {
@@ -1761,10 +2139,12 @@ fn as_client(msg: EventReason) {
     //let v: u8 = msg.into();
     //Sender::try_into
     //pipe().send(msg).unwrap();
-    pipe().write(&[msg.into()]).unwrap();
+    let mut p = pipe();
+    p.write(&[msg.into()]).unwrap();
+    let _ = p.close();
 }
 
-fn as_server() {
+async fn as_server() {
     //let b = sock();
     /*let b = sock();
     let rcv = Receiver::connect("/tmp/idlefd2").unwrap();*/
@@ -1805,6 +2185,8 @@ fn lock_blank_screen_gnome() {
     println!("Status: {}", o.status);
     println!("Blank output: {}", String::from_utf8(o.stderr).unwrap());
 }
+
+fn lock_blank_screen_2() {}
 
 fn lock_blank_screen() {
     for _i in 0..10 {
@@ -1851,136 +2233,12 @@ fn modprobe_list() -> &'static [&'static str] {
         "i2c_hid_acpi",
         "i2c_smbus",
         "psmouse",
+        //"btusb",
+        //"btintel",
         //"v4l2loopback",
-        "dell_laptop",
-        "dell_wmi",
+        //"dell_laptop",
+        //"dell_wmi",
         //"bluetooth",
-    ]
-}
-
-fn to_suspend_kws() -> Vec<&'static str> {
-    vec![
-        "evolution",
-        "fwupd",
-        "akonadi",
-        "sidewinderd",
-        /*
-        "boltd",
-        "pci_pme_list_scan",
-        "/usr/lib/upowerd",
-        "intel_display_power",
-        "polkit",
-        "i915",
-        "NetworkManager",
-        "i915_hpd_poll_init_work",
-        "output_poll_execute",*/
-        //"systemd-core",
-        //"systemd-logind",
-        //
-        /*"pipewire",
-        "wireplumber",
-        "gnome-shell",*/
-    ]
-}
-
-fn to_not_suspend_kws() -> Vec<&'static str> {
-    vec![
-        "lid",
-        "idle",
-        "sot",
-        "htop",
-        "powertop",
-        "power-usage-report",
-        "turbostat",
-        "sleep",
-        /*"gnome",
-        "init",
-        "systemd",
-        //"pipewire",
-        //"wireplumber",
-        "acpid",
-        "polkit",
-        "NetworkManager",
-        "gsd",
-        "ibus",
-        //"xdg",
-        "fuser",
-        "gjs",
-        //"akonadi",
-        //"fish",
-        "watchman",
-        //"mysql",
-        //"zeitgeist",
-        //"Xwayland",
-        "registry",
-        //"evolution",
-        "shell",
-        "gvfsd",
-        "fuse",
-        "gdm",
-        "rtkit",
-        "bluetooth",
-        "dbus",      */
-        //"kitty",
-        //"nano",
-        /*"bolt",
-        "nvidia",
-        "iio",
-        "kitty",
-        "nano",
-        "cargo",
-        "kworker",
-        "fwupd",
-        "upowerd",
-        "colord",
-        "udisk",
-        "irq",
-        "cryptd",
-        "nv_queue",
-        "card",
-        "gvt",
-        "nvme",
-        "charger",
-        "kstrp",
-        "ip",
-        "acpi",
-        "kthrotld",
-        "kswap",
-        "watchdog",
-        "ata",
-        "devfreq",
-        "edac",
-        "blk",
-        "kblock",
-        "kintegrity",
-        "khugepaged",
-        "ksmd",
-        "kcompact",
-        "writeback",
-        "oom_reaper",
-        "khung",
-        "kaudit",
-        "inet",
-        "kdev",
-        "migration",
-        "idle",
-        "cpu",
-        "dconf",
-        "accounts",
-        "USB",
-        "usb",
-        "UVM",
-        "uvm",
-        "ext4",
-        "kmpath",
-        "cfg",
-        "tpm",
-        "zswap",
-        "mld",
-        "rcu",
-        "netns",
-        "kthread",
-        "sudo",*/
     ]
 }
 
