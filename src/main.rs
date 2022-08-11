@@ -1,7 +1,14 @@
 #![feature(iter_intersperse)]
+#![feature(box_syntax)]
+
+use bus::BusReader;
+use drm::control::Device;
 
 use battery::*;
+use crossbeam::channel::{Receiver, Sender};
 use image::imageops;
+use panic_monitor::PanicMonitor;
+use parallel::{Trigger, recver};
 use procfs::process::{Stat, Status};
 use std::collections::HashMap;
 use std::env;
@@ -14,19 +21,26 @@ use std::str::FromStr;
 //use image::load_from_memory_with_format
 
 use std::sync::atomic::AtomicBool;
+//use std::sync::mpsc::Sender;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use drm::control::Device;
+//use lazy_static::lazy_static;
+
+#[macro_use]
+extern crate lazy_static;
+
 use ipipe::Pipe;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+
+use crate::parallel::{send_commit, wait_all, wait_commit, send};
 //use rayon::prelude::*;
 //use serde::{Deserialize, Serialize};
 //use unix_ipc::{Bootstrapper, Receiver, Sender};
 //use drm
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args: Vec<_> = env::args().collect();
 
     for a in args {
@@ -36,7 +50,7 @@ async fn main() {
             "power_connect" => as_client(EventReason::PowerConnect),
             "power_disconnect" => as_client(EventReason::PowerDisconnect),
             "power_button" => as_client(EventReason::PowerButton),
-            "server" => as_server().await,
+            "server" => as_server(),
             "dpms_check" => {
                 println!("DPMS status: {:?}", Monitors::get_dpms_status());
             }
@@ -44,566 +58,725 @@ async fn main() {
 
             "suspend" => as_client(EventReason::Suspend),
             "resume" => as_client(EventReason::Resume),
-            "test" => testing(),
             //"test" => testing(),
             _ => {}
         }
     }
 }
 
-/*mod parallel {
-    struct Command {
-        primary: String,
-    }
+fn pipe() -> Pipe {
+    let pipe = Pipe::with_name("idlefd3").unwrap();
+    pipe
+}
 
-    pub fn create<T>(channel_name: &'static str) {
-    }
-
-    pub fn send<T>
+/********fn sock() -> Bootstrapper<Message> {
+    let bootstrapper = Bootstrapper::bind("/tmp/idlefd2").unwrap();
+    bootstrapper
 }*/
 
-fn format_duration(d: std::time::Duration) -> String {
-    //let dur = chrono::Duration::from_std(d).unwrap_or(chrono::Duration::min_value());
-
-    //let hours = ()
-
-    //todo!()
-    use hhmmss::Hhmmss;
-
-    d.hhmmssxxx()
+fn as_client(msg: EventReason) {
+    //let v: u8 = msg.into();
+    //Sender::try_into
+    //pipe().send(msg).unwrap();
+    let mut p = pipe();
+    p.write(&[msg.into()]).unwrap();
+    let _ = p.close();
 }
 
-fn schedule_power_check() {
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_secs(600));
-        as_client(EventReason::DebugLowPowerStates);
-    });
+lazy_static! {
+    static ref PANIC_MONITOR: PanicMonitor = PanicMonitor::new();
 }
 
-struct System {
-    context: Context,
-    //devices: Vec<Box<dyn PoweredDevice>>,
-    display: Display,
-    display_late: DisplayLate,
-    wifi: Wifi,
-    bluetooth: Bluetooth,
-    platform: Platform,
+fn as_server() {
+    PANIC_MONITOR.init();
+    //let b = sock();
+    /*let b = sock();
+    let rcv = Receiver::connect("/tmp/idlefd2").unwrap();*/
 
-    battery_manager: battery::Manager,
+    //Platform::start();
 
-    info: HashMap<String, Data>,
+    let mut handles = Vec::new();
 
-    flags: SystemFlags,
+    for runner in [
+        || Platform::new().run(),
+        || Wifi::new().run(),
+        || Bluetooth::new().run(),
+        || Cpus::new().run(),
+        || VT::new().run(),
+        || Processes::new().run(),
+        || server_loop(),
+    ] {
+        let handle = std::thread::spawn(runner);
+        //handles.push(handle.thread().id());
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    //PANIC_MONITOR.wait(handles.as_slice());
+
+    //system.on_startup();
 }
 
-#[derive(Debug, Clone)]
-struct SystemFlags {
-    power_connected: bool,
-    lid_closed: bool,
-    sleeping: bool,
-    //deep_sleeping: bool,
-    power_button_spinner: bool,
+fn server_loop() {
+    let mut pipe = pipe();
 
-    time_sleeping: Duration,
-    time_active: Duration,
-    last_sleep_event: Instant,
-}
+    loop {
+        println!("Waiting for messages...");
+        //let msg: Message = rcv.recv().unwrap();
+        let mut msgb = [0u8];
+        //pipe.read_exact(&mut msgb).unwrap();
+        //let msg = Message::from_u8(msgb[0]);
+        //let msg = EventReason::from(msgb[0]);
+        //let msg: EventReason = msgb[0].try_into().unwrap();
+        if let Ok(_) = pipe.read_exact(&mut msgb) {
+            if let Ok(msg) = msgb[0].try_into() {
+                println!("Got a message! Message: {msg:?}");
 
-impl Default for SystemFlags {
-    fn default() -> Self {
-        Self {
-            power_connected: Default::default(),
-            lid_closed: Default::default(),
-            sleeping: Default::default(),
-            power_button_spinner: Default::default(),
-            time_sleeping: Default::default(),
-            time_active: Default::default(),
-            last_sleep_event: Instant::now(),
+                match msg {
+                    EventReason::Exit => break,
+                    EventReason::Check => {
+                        //system.print_report();
+                    }
+                    //other => system.handle_acpi(other),
+                    other => handle_acpi(other),
+                }
+            }
         }
     }
 }
 
-enum Data {
-    Bool(bool),
-    Integer(i64),
-    String(String),
-    Map(HashMap<String, Data>),
+fn handle_acpi(reason: EventReason) {
+    use parallel::Action;
+    use parallel::Device;
+    use parallel::Progress;
+
+    //let (send, recv) = register();
+
+    match reason {
+        EventReason::Resume | EventReason::LidOpen => send(Trigger {
+            for_dev: Device::Platform(),
+            from_dev: Device::Anonymous(),
+            announce: Action::Resume(),
+        }),
+
+        EventReason::Suspend | EventReason::LidClose => send(Trigger {
+            for_dev: Device::Platform(),
+            from_dev: Device::Anonymous(),
+            announce: Action::Suspend(),
+        }),
+        _ => (),
+    };
 }
 
-impl System {
-    fn on_startup(&mut self) {
-        //return;
-        // check if we need to recover from a failed suspend/resume cycle
-        // we only do this once, and delete the file, so that
-        // we don't trap ourselves in a loop
+mod parallel {
+    use std::sync::Mutex;
 
-        modprobe_on_list(modprobe_list(), true); // so we at least have keyboard and are relatively recoverable
+    use bus::{Bus, BusReader};
+    use crossbeam::channel::{Receiver, Sender};
+    use multiqueue::{BroadcastSender, BroadcastReceiver};
+    use once_cell::sync::OnceCell;
 
-        let suspended_procs =
-            std::fs::read_to_string("/tmp/suspended_procs").unwrap_or(String::default());
-        execute::shell("rm /tmp/suspended_procs").output().unwrap();
+    #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+    pub enum Progress {
+        PreStart(),
 
-        let mut pids: Vec<i32> = suspended_procs
-            .split(",")
-            .map(|substr| substr.parse().unwrap_or(-1))
+        Resuming(),
+        Resumed(),
+
+        Suspending(),
+        Suspended(),
+
+        Disabling(),
+        Disabled(),
+
+        Enabling(),
+        Enabled(),
+    }
+
+    #[derive(PartialEq, Eq, Clone, Debug)]
+    pub enum Action {
+        //Suspending(Progress),
+        //Resuming(Progress),
+        Resume(),
+
+        Suspend(),
+
+        Disable(),
+
+        Enable(),
+
+        PowerToggle(),
+
+        /// any action should wait for Commit
+        /// to be sent before stepping forward
+        Commit(),
+
+        Reply(Progress),
+    }
+
+    #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+    pub enum Device {
+        CPUs(),
+        Processes(),
+        Display(),
+        VT(),
+
+        Bluetooth(),
+        Wifi(),
+
+        Platform(),
+
+        Anonymous(),
+    }
+
+    #[derive(PartialEq, Eq, Clone, Debug)]
+    pub struct Trigger {
+        pub for_dev: Device,
+        pub from_dev: Device,
+        pub announce: Action,
+    }
+
+    impl Trigger {
+        pub fn new(announce: Action, from_dev: Device, for_dev: Device) -> Self {
+            Self {
+                announce,
+                from_dev,
+                for_dev,
+            }
+        }
+
+        pub fn send(self) {
+            //let _ = register().0.send(self);
+            send(self)
+        }
+    }
+
+    lazy_static! {
+        static ref PAIR: (Sender<Trigger>, Receiver<Trigger>) = crossbeam::channel::unbounded();
+        //static ref MQ: (BroadcastSender<Trigger>, BroadcastReceiver<Trigger>) = multiqueue::broadcast_queue(256);
+
+        static ref BUS: Mutex<Bus<Trigger>> = Mutex::new(bus::Bus::new(100));
+    }
+
+    pub fn recver() -> bus::BusReader<Trigger> {
+        BUS.lock().unwrap().add_rx()
+    }
+
+    pub fn send(t: Trigger) {
+        BUS.lock().unwrap().broadcast(t);
+    }
+
+    /*pub fn register() -> (Sender<Trigger>, Receiver<Trigger>) {
+        //static o: OnceCell<crossbeam::channel::Sender<Announcement>>
+
+        PAIR.clone()
+    }*/
+
+    pub fn wait_commit(r: &mut Receiver<Trigger>, from: Device) {
+        while let Ok(v) = r.recv() {
+            if from == v.from_dev {
+                if let Action::Commit() = v.announce {
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn send_commit(from_dev: Device) {
+        Trigger {
+            from_dev,
+            for_dev: Device::Anonymous(),
+            announce: Action::Commit(),
+        }.send();
+    }
+
+    /// returns only once all of the required announcement events
+    /// have fired
+    pub fn wait_all(r: &mut BusReader<Trigger>, mut set: Vec<Trigger>) {
+        while !set.is_empty() {
+            if let Ok(v) = r.recv() {
+                println!("Got a message: {v:?}");
+                set = set.into_iter().filter(|e| *e != v).collect();
+            }
+        }
+    }
+
+    pub fn wait_any(r: &mut Receiver<Trigger>, set: Vec<Trigger>) {
+        while let Ok(v) = r.recv() {
+            if set.contains(&v) {
+                break;
+            }
+        }
+    }
+}
+
+struct Platform {
+    recv: BusReader<Trigger>,
+    //send: Sender<Trigger>,
+
+    cstate_stats: Vec<u64>,
+}
+
+impl Platform {
+    /*pub fn start() -> JoinHandle<()> {
+        std::thread::spawn(|| {
+            Platform::new().run();
+        })
+    }*/
+
+    fn new() -> Self {
+        //let (send, recv) = parallel::register();
+        Self {
+            recv: recver(),
+            cstate_stats: vec![],
+        }
+    }
+
+    fn run(&mut self) {
+        use parallel::Action;
+        use parallel::Device;
+        use parallel::Progress;
+
+        while let Ok(trigger) = self.recv.recv() {
+            println!("platform got trigger: {trigger:?}");
+
+            match trigger.for_dev {
+                parallel::Device::Platform() => match trigger.announce {
+                    Action::Resume() => {
+                        println!("platform starting resume");
+
+                        println!("sent update");
+
+                        let trigger = Trigger::new(
+                            Action::Reply(Progress::Resuming()),
+                            Device::Platform(),
+                            Device::Anonymous(),
+                        );
+
+                        trigger.send();
+                        //self.send.send(trigger).unwrap();
+
+                        let mut wait_for = Vec::new();
+
+                        for dev in [
+                            Device::CPUs(),
+                            Device::Display(),
+                            Device::Bluetooth(),
+                            Device::Wifi(),
+                            Device::Processes(),
+                            Device::VT(),
+                        ] {
+                            /*let _ = self.send.send(Trigger {
+                                for_dev: dev.clone(),
+                                announce: Action::Resume(),
+                            });*/
+
+                            println!("sending trigger to resume");
+
+                            //trigger.send();
+                            Trigger {
+                                from_dev: Device::Platform(),
+                                for_dev: dev,
+                                announce: Action::Resume(),
+                            }.send();
+
+                            wait_for.push(Trigger {
+                                for_dev: dev,
+                                from_dev: Device::Platform(),
+                                announce: Action::Reply(Progress::Resumed()),
+                            })
+                        }
+
+                        send_commit(Device::Platform());
+
+                        println!("sent commit, waiting...");
+
+                        wait_all(&mut self.recv, wait_for);
+
+                        println!("done wait");
+
+                        /*self.send.send(Trigger {
+                            for_dev: Device::VT(), announce: Action::Resume()
+                        });*/
+
+                        let trigger = Trigger::new(
+                            Action::Reply(Progress::Resumed()),
+                            Device::Platform(),
+                            Device::Anonymous(),
+                        );
+
+                        trigger.send();
+
+                        //self.send.send(trigger).unwrap();
+
+                        println!("platform finished resume");
+
+                        //
+                    }
+                    Action::Suspend() => {
+                        println!("platform started suspend");
+                        Trigger {
+                            from_dev: Device::Platform(),
+                            for_dev: trigger.from_dev,
+                            announce: Action::Reply(Progress::Suspending()),
+                        }.send();
+
+                        let mut wait_for = Vec::new();
+
+                        for dev in [
+                            Device::CPUs(),
+                            Device::Display(),
+                            Device::Bluetooth(),
+                            Device::Wifi(),
+                            Device::Processes(),
+                            Device::VT(),
+                        ] {
+                            Trigger {
+                                from_dev: Device::Platform(),
+                                for_dev: dev,
+                                announce: Action::Suspend(),
+                            }.send();
+
+                            wait_for.push(Trigger {
+                                for_dev: dev,
+                                from_dev: Device::Platform(),
+                                announce: Action::Reply(Progress::Suspended()),
+                            })
+                        }
+
+                        send_commit(Device::Platform());
+
+                        std::thread::spawn(move || {
+                            wait_all(&mut recver(), wait_for);
+
+                            Trigger {
+                                from_dev: Device::Platform(),
+                                for_dev: trigger.from_dev,
+                                announce: Action::Reply(Progress::Suspended()),
+                            }.send();
+
+                            println!("platform finished suspend");
+                        });
+                    }
+
+                    _ => (),
+                },
+                _ => (),
+            }
+        }
+    }
+
+    fn debug_low_power(&mut self) {
+        println!("Checking stats");
+        let sample_1 = self.get_cstate_stats();
+
+        std::thread::sleep(Duration::from_secs(2));
+
+        let sample_2 = self.get_cstate_stats();
+
+        let counts: Vec<u64> = sample_1
+            .into_iter()
+            .zip(sample_2.into_iter())
+            .map(|(a, b)| b - a)
+            .rev()
             .collect();
 
-        pids.sort();
+        println!("Stats in rev order: {counts:?}");
 
-        // we want to iterate from highest PIDs to lowest so we don't have the "parent sees a dead
-        // child and panics" situation
+        let mut counts = counts.into_iter();
 
-        for pid in pids.iter().rev() {
-            let _ = nix::sys::signal::kill(Pid::from_raw(*pid), Signal::SIGCONT);
+        let c10 = counts.next().unwrap_or(1);
+        let c9 = counts.next().unwrap_or(1);
+        let c8 = counts.next().unwrap_or(1);
+        let c7 = counts.next().unwrap_or(1);
+        let c6 = counts.next().unwrap_or(1);
+        let c3 = counts.next().unwrap_or(1);
+        let c2 = counts.next().unwrap_or(1);
+
+        if c10 > 0 {
+            // sleeping peacefully :)
+        } else if c9 > 0 {
+            println!("Got to C9 but not C10, taking corrective actions");
+            // could be that TCSS is in a bad state, try reset USB-C/USB subsystem
+            // this is likely pipewire being naughty though, so instead of trying
+            // to fully reset the usb subsystem lets just..."restart" that
+            //let _ = execute::shell("killall pipewire pipewire-pulse").output();
+            println!("Restarting pipewire because an app probably left something open (fuck you, discord)");
+            let r = execute::shell("sudo -u sawyer XDG_RUNTIME_DIR=\"/run/user/$(id -u sawyer)\" systemctl --user restart pipewire pipewire-pulse").output();
+            if let Ok(o) = r {
+                println!("Ran restart of pw, stdout:");
+                println!(
+                    "{}",
+                    String::from_utf8(o.stdout).unwrap_or("not utf8".to_owned())
+                );
+                println!(
+                    "{}",
+                    String::from_utf8(o.stderr).unwrap_or("not utf8".to_owned())
+                );
+            } else {
+                println!("Failed to restart, unknown reason");
+            }
+            //println!("Res: {}", .stdout());
+
+            /*
+             * requirements for C10:
+             *  All VRs at PS4 or LPM.
+             *  Crystal clock off.
+             *  TCSS may enter lowest power state (TC cold) 2
+             */
+        } else if c8 > 0 {
+            println!("Got to C8 but not C9, will measure again, this is...strange");
+            /*
+             * requirements for C9:
+             *  All IA cores in C9 or deeper
+             *  display in PSR or off
+             *  VCCIO stays on
+             */
+        } else if c7 > 0 {
+            println!("Got to C7 but not C8, taking corrective actions");
+            /* requirements for C8:
+             *  C8 transient, involves LLC being flushed
+             */
+        } else if c6 > 0 {
+            println!("Got to C6 but not C7, taking corrective actions");
+            /* requirements for C7:
+             *  all IA cores requested C7
+             *  graphics cores in RC6 or deeper
+             *  platform allow proper LTR
+             */
+        } else if c3 > 0 {
+            println!("Got to C3 but not C6, taking corrective actions");
+            /* requirements for C6:
+             *  IA cores in C6 or deeper, GPU cores in RC6
+             *  BCLK is off
+             *  IMVP VRs voltage reduction, PSx state possible
+             *
+             *  try to wrest anything using GPU away from it?
+             *  Likely GDM is in a weird state here unless something
+             *  was between transactions. Try just retrying sleep cycle?
+             */
+            //self.async_resume_suspend_cycle(10);
+
+            // for some reason adb sometimes gets us stuck in this state
+            //let r = execute::shell("sudo adb kill-server").output();
+        } else if c2 > 0 {
+            println!("Got to C2 but not C3, taking corrective actions");
+            // if we aren't getting deeper than this during *sleep* then realistically all hope is
+            // lost, just...don't
+            //self.async_resume_suspend_cycle(10);
+        } else {
+            println!("Never left C0!");
+            // something is just eating our cpu whole and we're stuck in c0, abort??
         }
 
-        std::thread::spawn(|| {
-            // if we're in a backpack let's try not to melt the user
-            std::thread::sleep(Duration::from_secs(10));
+        if c10 < 1 {
+            println!("Doing uniform tasks to try to recover things");
 
-            let state = std::fs::read_to_string("/proc/acpi/button/lid/LID0/state").unwrap();
-            if state.contains("closed") {
-                as_client(EventReason::LidClose);
-            }
-        });
+            println!("Restarting pipewire because an app probably left something open (fuck you, discord)");
+            let _r = execute::shell("sudo -u sawyer XDG_RUNTIME_DIR=\"/run/user/$(id -u sawyer)\" systemctl --user restart pipewire pipewire-pulse").output();
+
+            let _r = execute::shell("killall adb");
+        }
+
+        // schedule another checkup
+        //schedule_power_check();
     }
 
-    fn devices(&mut self) -> Vec<&mut dyn PoweredDevice> {
-        vec![
-            &mut self.wifi,
-            &mut self.bluetooth,
-            &mut self.display,
-            &mut self.platform,
-            &mut self.display_late,
+    fn get_cstate_stats(&self) -> Vec<u64> {
+        let empty = vec![0u64; 7];
+
+        let cf = File::open("/sys/kernel/debug/pmc_core/package_cstate_show");
+
+        if let Ok(mut cf) = cf {
+            let mut build = Vec::new();
+            let mut buf = String::new();
+
+            let _ = cf.read_to_string(&mut buf);
+
+            for line in buf.lines() {
+                let num = line
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+
+                build.push(num);
+            }
+            //cf.
+            //cf.close();
+
+            build
+        } else {
+            empty
+        }
+    }
+
+    fn print_cstate_stats(&self, old: Vec<u64>, new: Vec<u64>) {
+        println!("Cstate stats:");
+        let combined: Vec<u64> = old.iter().zip(new.iter()).map(|(a, b)| b - a).collect();
+
+        let labels = vec!["C2", "C3", "C6", "C7", "C8", "C9", "C10"];
+
+        let total: u64 = combined.iter().sum();
+
+        let combined: Vec<(u64, &str)> = combined.into_iter().zip(labels.into_iter()).collect();
+
+        for (state, label) in combined.iter() {
+            let percent = 100.0 * (*state as f64 / total as f64);
+            println!("Package {label} : {percent:.03}% of total",)
+        }
+    }
+
+    fn load_us_modules(&mut self) {
+        self.modprobe_on_list(self.modprobe_list(), true);
+    }
+
+    fn unload_us_modules(&mut self) {
+        self.modprobe_on_list(
+            self.modprobe_list()
+                .iter()
+                .rev()
+                .map(|e| *e)
+                .collect::<Vec<&str>>()
+                .as_slice(),
+            false,
+        );
+    }
+
+    fn modprobe(&self, module: &str, load: bool) -> Option<()> {
+        match load {
+            true => Command::new("modprobe").arg(module).output(),
+            false => Command::new("modprobe").arg("-r").arg(module).output(),
+        }
+        .ok()?;
+
+        Some(())
+    }
+
+    fn modprobe_on_list(&self, list: &[&str], load: bool) {
+        for elem in list {
+            self.modprobe(elem, load);
+        }
+    }
+
+    fn modprobe_list(&self) -> &'static [&'static str] {
+        &[
+            "i2c_hid",
+            "i2c_hid_acpi",
+            "i2c_smbus",
+            "psmouse",
+            //"btusb",
+            //"btintel",
+            //"v4l2loopback",
+            //"dell_laptop",
+            //"dell_wmi",
+            //"bluetooth",
         ]
     }
 
-    fn new() -> Self {
-        System {
-            context: Context::default(),
-            //devices: vec![Wifi::create(), Bluetooth::create(), Platform::create()],
-            display: *Display::create(),
-            display_late: *DisplayLate::create(),
-            wifi: *Wifi::create(),
-            bluetooth: *Bluetooth::create(),
-            platform: *Platform::create(),
-            //devices: vec![Platform::create()],
-            //devices: vec![Display::create()],
-            battery_manager: battery::Manager::new().unwrap(),
-            info: HashMap::new(),
-            flags: Default::default(),
-        }
-    }
+    /// a minimum of 1 core is enabled regardless of requested count
+    fn set_enabled_core_count(&mut self, count: usize) {
+        println!("We have {} cpus available", num_cpus::get());
+        let bounded = count.max(1usize);
 
-    fn power_button(&mut self) {
-        self.flags.power_button_spinner = !self.flags.power_button_spinner;
+        let bounded = bounded.min(num_cpus::get());
 
-        if self.flags.power_button_spinner {
-            self.flags.sleeping = !self.flags.sleeping;
-
-            if self.flags.sleeping {
-                self.do_suspend();
-            } else {
-                self.do_resume();
-            }
-        }
-    }
-
-    fn lid_open(&mut self) {
-        self.flags.lid_closed = false;
-
-        if self.flags.sleeping {
-            //self.flags.sleeping = false;
-            self.resume()
-        }
-    }
-
-    fn lid_close(&mut self) {
-        self.flags.lid_closed = true;
-
-        if !self.flags.power_connected {
-            if !self.flags.sleeping {
-                //self.flags.sleeping = true;
-                self.suspend();
-            }
-        } else {
-            println!("Inhibiting sleep since power is connected")
-        }
-    }
-
-    fn power_connect(&mut self) {
-        self.flags.power_connected = true;
-    }
-
-    fn power_disconnect(&mut self) {
-        self.flags.power_connected = false;
-
-        // really we should only do this if we're "charged"
-        if true {
-            self.flags.time_active = Duration::ZERO;
-            self.flags.time_sleeping = Duration::ZERO;
-        }
-
-        // If we're disconnecting power and the lid is shut,
-        // we want system to go into suspend
-        if !self.flags.sleeping && self.flags.lid_closed {
-            self.flags.sleeping = true;
-            self.suspend();
-        }
-    }
-
-    fn suspend(&mut self) {
-        self.flags.sleeping = true;
-        self.do_suspend();
-    }
-
-    fn resume(&mut self) {
-        self.flags.sleeping = false;
-        self.do_resume();
-    }
-
-    fn handle_acpi(&mut self, event: EventReason) {
-        use EventReason::*;
-
-        match event {
-            PowerButton => self.power_button(),
-            LidOpen => self.lid_open(),
-            Suspend => self.do_suspend(),
-            Resume => self.do_resume(),
-            LidClose => self.lid_close(),
-            PowerConnect => self.power_connect(),
-            PowerDisconnect => self.power_disconnect(),
-            DebugLowPowerStates => {
-                if self.flags.sleeping {
-                    self.platform.debug_low_power();
-                }
-            }
-            /*Suspend => self.do_suspend(),
-            Resume => self.do_resume(),*/
-            _ => (),
-        }
-    }
-
-    fn do_suspend(&mut self) {
-        self.flags.sleeping = true;
-
-        let last_event = self.flags.last_sleep_event;
-        let now = Instant::now();
-
-        let awake_for = now - last_event;
-
-        self.flags.time_active += awake_for;
-        self.flags.last_sleep_event = now;
-
-        let start = Instant::now();
-
-        for d in self.devices().iter_mut() {
-            d.detect();
-
-            if d.should_block_sleep() {
-                d.suspend();
-            }
-        }
-
-        let end = Instant::now();
-
-        println!(
-            "Suspend took {} seconds, unknown seconds since screen was locked",
-            (end - start).as_secs_f64(),
-            //(end - post_lock).as_secs_f64()
-        );
-
-        println!("Running a sleep study");
-        //return;
-
-        //let mut o = execute::shell("turbostat --show Pkg%pc2,Pkg%pc3,Pkg%pc6,Pkg%pc7,Pkg%pc8,Pkg%pc9,Pk%pc10,SYS%LPI sleep 300");
-        //let mut o = execute::shell("power-usage-report");
-        let mut o = execute::shell("/home/sawyer/oss/idle/while_sleeping.sh");
-        let o = o.output();
-        if let Ok(o) = o {
-            let os = String::from_utf8(o.stdout).unwrap_or(String::new());
-            let oe = String::from_utf8(o.stderr).unwrap_or(String::new());
-
-            //use std::fmt::Write;
-            let f = std::fs::File::create("/home/sawyer/oss/idle/while_sleeping_output.txt");
-            if let Ok(mut f) = f {
-                let _ = writeln!(f, "Stdout:");
-                let _ = writeln!(f, "{os}");
-                let _ = writeln!(f, "Stderr:");
-                let _ = writeln!(f, "{oe}");
-            }
-        }
-
-        schedule_power_check()
-    }
-
-    fn do_resume(&mut self) {
-        self.flags.sleeping = false;
-
-        let last_event = self.flags.last_sleep_event;
-        let now = Instant::now();
-
-        let sleeping_for = now - last_event;
-
-        self.flags.last_sleep_event = now;
-        self.flags.time_sleeping += sleeping_for;
-        // unpowermanage devices in reverse suspend order, starting with platform
-        for d in self.devices().iter_mut().rev() {
-            d.resume(); // noop if wasn't suspended or if device couldn't block sleep
-        }
-
-        println!(
-            "Device was sleeping for {} seconds",
-            sleeping_for.as_secs_f64()
-        );
-
-        println!(
-            "So far device has spent {} seconds 'resumed' and {} seconds 'suspended'",
-            format_duration(self.flags.time_active),
-            format_duration(self.flags.time_sleeping)
-        );
-    }
-
-    fn print_report(&mut self) {
-        println!(
-            "Current power status is: {:?}",
-            BatteryStatistic::collect(self.battery_manager.batteries().unwrap())
-        );
-        for dev in self.devices().iter_mut() {
-            let rep = dev.report().unwrap();
-            let devname = dev.name();
-
-            println!("Report for device {devname}:");
-            println!("\t{rep:?}")
-        }
+        for idx in 0..bounded {}
     }
 }
 
-//#[derive(Serialize, Deserialize, Debug)]
-/*enum Message {
-    Suspend(),
-    Resume(),
-    Exit(),
-}
-
-impl Message {
-    fn as_u8(&self) -> u8 {
-        match self {
-            Self::Suspend() => 1,
-            Self::Resume() => 2,
-            Self::Exit() => 3,
-        }
-    }
-
-    fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Self::Suspend(),
-            2 => Self::Resume(),
-            3 => Self::Exit(),
-            _ => panic!("bad message"),
-        }
-    }
-}*/
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-struct BatteryStatistic {
-    /// current battery percentage
-    battery_pct: f32,
-
-    /// watt hours remaining
-    battery_energy: f32,
-
-    /// positive if charging, negative if
-    /// discharging, measured in watts
-    energy_rate: f32,
-
-    display_dpms_state: DPMSState,
-
-    time: Instant,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct DeviceStatistic {
-    time_sleeping: Duration,
-    time_active: Duration,
-    time_disabled: Duration,
-}
-
-impl BatteryStatistic {
-    #[allow(dead_code)]
-    fn collect(mut batteries: Batteries) -> BatteryStatistic {
-        let batt = batteries.next().unwrap().unwrap();
-        let rate = batt.energy_rate().get::<battery::units::power::watt>();
-        let charge = batt.energy().get::<battery::units::energy::watt_hour>();
-        let charge_full = batt
-            .energy_full()
-            .get::<battery::units::energy::watt_hour>();
-        //battery.energy().get::<battery::units::Energy>();
-
-        BatteryStatistic {
-            battery_pct: (charge / charge_full),
-            battery_energy: charge,
-            energy_rate: rate,
-            display_dpms_state: DPMSState::Unknown,
-            time: Instant::now(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SleepState {
-    Sleeping(),
-    Awake(),
-    Unknown(),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum DPMSState {
-    On = 0,
-    Standby = 1,
-    Suspend = 2,
-    Off = 3,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum LidState {
-    Open,
-    Closed,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DevicePowerState {
-    Enabled,
-    Disabled,
-    PowerSave,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DeviceState {
-    power: DevicePowerState,
-    present: DevicePresenceState,
-}
-
-impl DeviceState {
-    fn present_on() -> Self {
-        DeviceState {
-            power: DevicePowerState::Enabled,
-            present: DevicePresenceState::Present,
-        }
-    }
-
-    fn unknown() -> Self {
-        DeviceState {
-            power: DevicePowerState::Unknown,
-            present: DevicePresenceState::Unknown,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DevicePresenceState {
-    Present,
-    Missing,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct DeviceStateTransition {
-    old: DeviceState,
-    new: DeviceState,
-    time: Instant,
-}
-
-impl DeviceStateTransition {
-    pub fn new(old: DeviceState, new: DeviceState) -> Self {
-        Self {
-            old,
-            new,
-            time: Instant::now(),
-        }
-    }
-
-    pub fn first() -> Self {
-        Self::new(DeviceState::unknown(), DeviceState::present_on())
-    }
-
-    //pub fn first(old: DeviceState::unknown(), new: DeviceState::present_on())
-}
-
-#[derive(Debug, Clone)]
-struct DisplayLate {
-    log: Vec<DeviceStateTransition>,
-}
-
-impl DisplayLate {
-    fn create() -> Box<Self> {
-        Box::new(Self {
-            log: vec![DeviceStateTransition::first()],
-        })
-    }
-}
-
-impl PoweredDevice for DisplayLate {
-    fn name(&self) -> &'static str {
-        "display_late"
-    }
-
-    fn detect(&mut self) {
-        ()
-    }
-
-    fn enable(&mut self) {
-        Monitors::hold_resume_display();
-        let _ = Monitors::set_dpms(DPMSState::On);
-    }
-
-    fn disable(&mut self) {
-        let _ = Monitors::set_dpms(DPMSState::Suspend);
-    }
-
-    fn state(&self) -> DeviceState {
-        DeviceState::unknown()
-    }
-
-    fn set_power(&mut self, state: DevicePowerState) {
-        ()
-    }
-
-    fn should_block_sleep(&self) -> bool {
-        true
-    }
-
-    fn events_mut(&mut self) -> &mut Vec<DeviceStateTransition> {
-        &mut self.log
-    }
-
-    fn events(&self) -> &[DeviceStateTransition] {
-        &self.log
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Display {
-    state: DeviceState,
-    log: Vec<DeviceStateTransition>,
-
+struct VT {
+    recv: BusReader<Trigger>,
+    //send: Sender<Trigger>,
+    suspended: bool,
     active_tty: String,
 }
 
-impl Display {
-    fn create() -> Box<Self> {
-        Box::new(Self {
-            state: DeviceState::present_on(),
-            log: vec![DeviceStateTransition::first()],
-            active_tty: Self::active_tty(),
+impl VT {
+    pub fn start() -> JoinHandle<()> {
+        std::thread::spawn(|| {
+            VT::new().run();
         })
     }
 
-    fn active_tty() -> String {
+    fn new() -> Self {
+        //let (send, recv) = parallel::register();
+        Self {
+            recv: recver(),
+            suspended: false,
+            active_tty: String::new(),
+        }
+    }
+
+    fn run(&mut self) {
+        use parallel::Action;
+        use parallel::Device;
+        use parallel::Progress;
+
+        while let Ok(trigger) = self.recv.recv() {
+            match (trigger.for_dev, trigger.announce) {
+                (Device::Platform(), Action::Resume()) => {
+                    if self.suspended {
+                        wait_all(
+                            &mut self.recv,
+                            vec![
+                                Trigger {
+                                    from_dev: Device::Processes(),
+                                    for_dev: Device::Anonymous(),
+                                    announce: Action::Reply(Progress::Resumed()),
+                                },
+                                Trigger {
+                                    from_dev: Device::Display(),
+                                    for_dev: Device::Anonymous(),
+                                    announce: Action::Reply(Progress::Resumed()),
+                                },
+                            ],
+                        );
+
+                        self.suspended = true;
+
+                        self.change_vt(&self.active_tty);
+                    }
+
+                    Trigger {
+                        from_dev: Device::VT(),
+                        for_dev: Device::Anonymous(),
+                        announce: Action::Reply(Progress::Resumed()),
+                    }.send();
+                }
+                (Device::Platform(), Action::Suspend()) => {
+                    if !self.suspended {
+                        self.active_tty = self.get_active_tty();
+
+                        let _ = execute::shell("echo 0 > /sys/class/graphics/fbcon/cursor_blink")
+                            .output();
+                        let _ = execute::shell("openvt --switch bash").output();
+                    }
+
+                    Trigger {
+                        from_dev: Device::VT(),
+                        for_dev: Device::Anonymous(),
+                        announce: Action::Reply(Progress::Suspended()),
+                    }.send();
+                }
+
+                _ => (),
+            }
+        }
+    }
+
+    fn change_vt(&self, target: &str) {
+        std::process::Command::new("chvt")
+            .arg(&target[3..])
+            .output()
+            .unwrap();
+    }
+
+    fn get_active_tty(&mut self) -> String {
         /*let num = String::from_utf8(execute::shell("tty").output().unwrap().stdout).unwrap();
         let num = num.split("/").collect::<Vec<&str>>().into_iter().rev().next().unwrap();
 
@@ -613,106 +786,130 @@ impl Display {
 
         String::from_utf8(output.map(|o| o.stdout).unwrap_or(vec![])).unwrap_or("tty2".into())
     }
-
-    fn unblank(&mut self) {
-        println!("unblanking to: {}", self.active_tty);
-
-
-        //let _ = Monitors::set_dpms(DPMSState::On);
-
-        //std::thread::sleep_ms(500);
-        //std::thread::sleep_ms(30);
-
-        println!("switching back to original tty");
-        change_vt(&self.active_tty);
-        println!("done switch");
-    }
-
-    fn blank(&mut self) {
-        println!("switching to new vt");
-        //let _ = execute::shell("openvt --switch bash").output();
-        //execute::shell("openvt --switch \"echo 0 > /sys/class/graphics/fbcon/cursor_blink && bash\"");
-        let _ = execute::shell("echo 0 > /sys/class/graphics/fbcon/cursor_blink").output();
-        let _ = execute::shell("openvt --switch bash").output();
-        println!("blanking");
-
-        //let _ = Monitors::hold_resume_display();
-
-        //let _ = Monitors::set_dpms(DPMSState::Suspend);
-        //let _ = execute::shell("setterm --blank 0 --powerdown 0").output();
-    }
 }
 
-impl PoweredDevice for Display {
-    fn events(&self) -> &[DeviceStateTransition] {
-        self.log.as_slice()
+struct Processes {
+    frozen_processes: Vec<FreezableProcess>,
+    processes: Vec<procfs::process::Process>,
+
+    suspended: bool,
+
+    //send: Sender<Trigger>,
+    recv: BusReader<Trigger>,
+}
+
+impl Processes {
+    pub fn new() -> Self {
+        //let (send, recv) = register();
+        Self {
+            suspended: false,
+            frozen_processes: vec![],
+            processes: vec![],
+            recv: recver(),
+        }
     }
 
-    fn events_mut(&mut self) -> &mut Vec<DeviceStateTransition> {
-        &mut self.log
+    fn gather_procs(&mut self) -> Vec<FreezableProcess> {
+        let mut r: Vec<FreezableProcess> = procfs::process::all_processes()
+            .unwrap()
+            .into_iter()
+            .map(|proc| FreezableProcess::new(proc))
+            .collect();
+
+        r.sort_by_key(|p| p.pid()); // first sort by pid to disambiguate parent-child within same jiffy
+
+        r.sort_by_key(|p| p.backing_process.stat().unwrap().starttime); // sort by start time, since pids could wrap
+
+        r
     }
 
-    fn enable(&mut self) {
-        // don't do anything here :)
-        self.unblank();
+    fn suspend_userspace(&mut self) {
+        self.frozen_processes = self.gather_procs();
 
-        self.state.power = DevicePowerState::Enabled;
+        for proc in self.frozen_processes.iter_mut() {
+            proc.suspend();
+        }
     }
 
-    fn disable(&mut self) {
-        self.active_tty = Self::active_tty();
+    fn resume_userspace(&mut self) {
+        println!("Unfreezing {} processes", self.frozen_processes.len());
 
-        //lock_blank_screen();
+        let mut pstats = Vec::new();
 
-        self.blank();
+        for proc in self.frozen_processes.iter_mut().rev() {
+            let pstat = proc.resume();
 
-        std::thread::sleep(Duration::from_secs(2));
-
-        self.state.power = DevicePowerState::Disabled;
-    }
-
-    fn state(&self) -> DeviceState {
-        self.state
-    }
-
-    fn set_power(&mut self, state: DevicePowerState) {
-        self.state.power = state;
-    }
-
-    fn should_block_sleep(&self) -> bool {
-        true
-    }
-
-    fn detect(&mut self) {
-        println!("Monitor detect called");
-
-        let status = Monitors::get_dpms_status();
-
-        println!("Got status: {status:?}");
-
-        let status = match status {
-            Ok(DPMSState::On) => DevicePowerState::Enabled,
-            Ok(DPMSState::Off) => DevicePowerState::Disabled,
-            Ok(DPMSState::Unknown) => DevicePowerState::Unknown,
-            Ok(_) => DevicePowerState::PowerSave,
-            Err(e) => {
-                println!("Got detection error: {e}");
-                DevicePowerState::Unknown
+            if let Some(pstat) = pstat {
+                pstats.push(pstat);
             }
-        };
+        }
 
-        let presence = DevicePresenceState::Present;
-
-        self.state = DeviceState {
-            power: status,
-            present: presence,
-        };
-
-        self.handle_detect(self.state);
+        self.print_proc_stats(pstats);
     }
 
-    fn name(&self) -> &'static str {
-        "display"
+    fn print_proc_stats(&self, mut stats: Vec<ProcessStats>) {
+        println!("Process statistics:");
+
+        fn print_proc(s: &ProcessStats) {
+            println!(
+                "Process {} ({}) took {} utime, {} stime and had suspend state {}",
+                s.pid, s.command, s.utime, s.stime, s.was_suspended
+            );
+        }
+
+        stats.sort_by_key(|p| p.stime);
+
+        println!("By stime:");
+        stats.iter().rev().take(30).for_each(|s| {
+            if s.stime > 0 {
+                print_proc(s);
+            }
+        });
+
+        stats.sort_by_key(|p| p.utime);
+
+        println!("By utime:");
+        stats.iter().rev().take(30).for_each(|s| {
+            if s.utime > 0 {
+                print_proc(s);
+            }
+        });
+    }
+
+    pub fn run(&mut self) {
+        use parallel::Action;
+        use parallel::Device;
+        use parallel::Progress;
+
+        while let Ok(trigger) = self.recv.recv() {
+            match (trigger.for_dev, trigger.announce) {
+                (Device::Platform(), Action::Resume()) => {
+                    if self.suspended {
+                        //self.resume_userspace();
+                    }
+
+                    Trigger {
+                        announce: Action::Reply(Progress::Resumed()),
+                        from_dev: Device::Processes(),
+                        for_dev: Device::Anonymous(),
+                    }.send();
+                }
+
+                (Device::Platform(), Action::Suspend()) => {
+                    if !self.suspended {
+                        //self.suspend_userspace();
+                    }
+
+                    Trigger {
+                        announce: Action::Reply(Progress::Suspended()),
+                        from_dev: Device::Processes(),
+                        for_dev: Device::Anonymous(),
+                    }.send();
+                }
+
+                _ => (),
+            }
+        }
     }
 }
 
@@ -922,9 +1119,51 @@ struct Cpus {
     //available: Vec<u64>,
 
     //enabled: Vec<u64>,
+    //send: Sender<Trigger>,
+    recv: BusReader<Trigger>,
+
+    suspended: bool,
 }
 
 impl Cpus {
+    pub fn run(&mut self) {
+        use parallel::Action;
+        use parallel::Device;
+        use parallel::Progress;
+
+        while let Ok(trigger) = self.recv.recv() {
+            match (trigger.for_dev, trigger.announce) {
+                (Device::Platform(), Action::Resume()) => {
+                    println!("cpus told to resume");
+                    if self.suspended {
+                        self.powersave();
+                    }
+
+                    Trigger {
+                        announce: Action::Reply(Progress::Resumed()),
+                        from_dev: Device::CPUs(),
+                        for_dev: Device::Anonymous(),
+                    }.send();
+                }
+
+                (Device::Platform(), Action::Suspend()) => {
+                    println!("cpus told to suspend");
+                    if !self.suspended {
+                        //self.superpowersave();
+                    }
+
+                    Trigger {
+                        announce: Action::Reply(Progress::Suspended()),
+                        from_dev: Device::CPUs(),
+                        for_dev: Device::Anonymous(),
+                    }.send();
+                }
+
+                _ => (),
+            }
+        }
+    }
+
     fn parse_range(line: &str) -> Vec<usize> {
         let mut builder = Vec::new();
 
@@ -1018,548 +1257,119 @@ impl Cpus {
         self.enable_count(128); // just...don't use this script with a dual socket amd epyc :)
     }
 
-    fn create() -> Self {
-        Self {}
+    fn new() -> Self {
+        //let (send, recv) = parallel::register();
+        Self {
+            recv: recver(),
+            suspended: false,
+        }
     }
 }
 
-/// Describes the SoC/RAM/Chipset
-/// as a power manageable component
-///
-/// Here, only for tracking when we
-/// try entering different power states such as "sleep"
-struct Platform {
-    frozen_processes: Vec<FreezableProcess>,
-    state: DeviceState,
-    log: Vec<DeviceStateTransition>,
-
-    cpus: Cpus,
-
-    cstate_stats: Vec<u64>,
-
-    processes: Vec<procfs::process::Process>,
-}
-
-impl Platform {
-    fn create() -> Box<Self> {
-        let s = Self {
-            cpus: Cpus::create(),
-            cstate_stats: vec![0u64; 7],
-            processes: Vec::new(),
-            frozen_processes: Vec::new(),
-            state: DeviceState::present_on(),
-            log: vec![DeviceStateTransition::first()],
-        };
-
-        let b = Box::new(s);
-
-        b
-    }
-
-    fn gather_procs(&mut self) -> Vec<FreezableProcess> {
-        let mut r: Vec<FreezableProcess> = procfs::process::all_processes()
-            .unwrap()
-            .into_iter()
-            .map(|proc| FreezableProcess::new(proc))
-            .collect();
-
-        r.sort_by_key(|p| p.pid()); // first sort by pid to disambiguate parent-child within same jiffy
-
-        r.sort_by_key(|p| p.backing_process.stat().unwrap().starttime); // sort by start time, since pids could wrap
-
-        r
-    }
-
-    fn debug_low_power(&mut self) {
-        println!("Checking stats");
-        let sample_1 = self.get_cstate_stats();
-
-        std::thread::sleep(Duration::from_secs(2));
-
-        let sample_2 = self.get_cstate_stats();
-
-        let counts: Vec<u64> = sample_1
-            .into_iter()
-            .zip(sample_2.into_iter())
-            .map(|(a, b)| b - a)
-            .rev()
-            .collect();
-
-        println!("Stats in rev order: {counts:?}");
-
-        let mut counts = counts.into_iter();
-
-        let c10 = counts.next().unwrap_or(1);
-        let c9 = counts.next().unwrap_or(1);
-        let c8 = counts.next().unwrap_or(1);
-        let c7 = counts.next().unwrap_or(1);
-        let c6 = counts.next().unwrap_or(1);
-        let c3 = counts.next().unwrap_or(1);
-        let c2 = counts.next().unwrap_or(1);
-
-        if c10 > 0 {
-            // sleeping peacefully :)
-        } else if c9 > 0 {
-            println!("Got to C9 but not C10, taking corrective actions");
-            // could be that TCSS is in a bad state, try reset USB-C/USB subsystem
-            // this is likely pipewire being naughty though, so instead of trying
-            // to fully reset the usb subsystem lets just..."restart" that
-            //let _ = execute::shell("killall pipewire pipewire-pulse").output();
-            println!("Restarting pipewire because an app probably left something open (fuck you, discord)");
-            let r = execute::shell("sudo -u sawyer XDG_RUNTIME_DIR=\"/run/user/$(id -u sawyer)\" systemctl --user restart pipewire pipewire-pulse").output();
-            if let Ok(o) = r {
-                println!("Ran restart of pw, stdout:");
-                println!(
-                    "{}",
-                    String::from_utf8(o.stdout).unwrap_or("not utf8".to_owned())
-                );
-                println!(
-                    "{}",
-                    String::from_utf8(o.stderr).unwrap_or("not utf8".to_owned())
-                );
-            } else {
-                println!("Failed to restart, unknown reason");
-            }
-            //println!("Res: {}", .stdout());
-
-            /*
-             * requirements for C10:
-             *  All VRs at PS4 or LPM.
-             *  Crystal clock off.
-             *  TCSS may enter lowest power state (TC cold) 2
-             */
-        } else if c8 > 0 {
-            println!("Got to C8 but not C9, will measure again, this is...strange");
-            /*
-             * requirements for C9:
-             *  All IA cores in C9 or deeper
-             *  display in PSR or off
-             *  VCCIO stays on
-             */
-        } else if c7 > 0 {
-            println!("Got to C7 but not C8, taking corrective actions");
-            /* requirements for C8:
-             *  C8 transient, involves LLC being flushed
-             */
-        } else if c6 > 0 {
-            println!("Got to C6 but not C7, taking corrective actions");
-            /* requirements for C7:
-             *  all IA cores requested C7
-             *  graphics cores in RC6 or deeper
-             *  platform allow proper LTR
-             */
-        } else if c3 > 0 {
-            println!("Got to C3 but not C6, taking corrective actions");
-            /* requirements for C6:
-             *  IA cores in C6 or deeper, GPU cores in RC6
-             *  BCLK is off
-             *  IMVP VRs voltage reduction, PSx state possible
-             *
-             *  try to wrest anything using GPU away from it?
-             *  Likely GDM is in a weird state here unless something
-             *  was between transactions. Try just retrying sleep cycle?
-             */
-            //self.async_resume_suspend_cycle(10);
-
-            // for some reason adb sometimes gets us stuck in this state
-            //let r = execute::shell("sudo adb kill-server").output();
-        } else if c2 > 0 {
-            println!("Got to C2 but not C3, taking corrective actions");
-            // if we aren't getting deeper than this during *sleep* then realistically all hope is
-            // lost, just...don't
-            //self.async_resume_suspend_cycle(10);
-        } else {
-            println!("Never left C0!");
-            // something is just eating our cpu whole and we're stuck in c0, abort??
-        }
-
-        if c10 < 1 {
-            println!("Doing uniform tasks to try to recover things");
-
-            println!("Restarting pipewire because an app probably left something open (fuck you, discord)");
-            let _r = execute::shell("sudo -u sawyer XDG_RUNTIME_DIR=\"/run/user/$(id -u sawyer)\" systemctl --user restart pipewire pipewire-pulse").output();
-
-            let _r = execute::shell("killall adb");
-        }
-
-        // schedule another checkup
-        schedule_power_check();
-    }
-
-    fn async_resume_suspend_cycle(&self, seconds: u64) {
-        std::thread::spawn(move || {
-            as_client(EventReason::Resume);
-            std::thread::sleep(Duration::from_secs(seconds));
-            let _ = execute::shell("notify-send 'force gdm to wake for a moment'").output();
-            std::thread::sleep(Duration::from_secs(1));
-            as_client(EventReason::Suspend);
-        });
-    }
-
-    fn get_cstate_stats(&self) -> Vec<u64> {
-        let empty = vec![0u64; 7];
-
-        let cf = File::open("/sys/kernel/debug/pmc_core/package_cstate_show");
-
-        if let Ok(mut cf) = cf {
-            let mut build = Vec::new();
-            let mut buf = String::new();
-
-            let _ = cf.read_to_string(&mut buf);
-
-            for line in buf.lines() {
-                let num = line
-                    .split_whitespace()
-                    .last()
-                    .unwrap_or("0")
-                    .parse()
-                    .unwrap_or(0);
-
-                build.push(num);
-            }
-            //cf.
-            //cf.close();
-
-            build
-        } else {
-            empty
-        }
-    }
-
-    fn print_cstate_stats(&self, old: Vec<u64>, new: Vec<u64>) {
-        println!("Cstate stats:");
-        let combined: Vec<u64> = old.iter().zip(new.iter()).map(|(a, b)| b - a).collect();
-
-        let labels = vec!["C2", "C3", "C6", "C7", "C8", "C9", "C10"];
-
-        let total: u64 = combined.iter().sum();
-
-        let combined: Vec<(u64, &str)> = combined.into_iter().zip(labels.into_iter()).collect();
-
-        for (state, label) in combined.iter() {
-            let percent = 100.0 * (*state as f64 / total as f64);
-            println!("Package {label} : {percent:.03}% of total",)
-        }
-    }
-
-    /// Allows going into an even deeper sleep,
-    /// where we suspend things like journald
-    /// and upowerd even though other
-    /// parts of this script rely on them
-    fn powernap_for(&mut self, time: Duration) {
-        let to_freeze = self.gather_procs();
-
-        for proc in to_freeze {}
-    }
-
-    fn suspend_userspace(&mut self) {
-        self.frozen_processes = self.gather_procs();
-
-        //self.frozen_processes.sort_by_key(|p| p.pid());
-        self.cpus.superpowersave();
-
-        //let r = self.frozen_processes.iter().map(|p| p.pid().to_string()).intersperse(",".to_owned());
-
-        //let c: String = r.collect();
-
-        //let _ = std::fs::write("/tmp/suspended_procs", c); // don't want this to completely
-        // break flow if it fails
-
-        for proc in self.frozen_processes.iter_mut() {
-            proc.suspend();
-        }
-
-        self.cstate_stats = self.get_cstate_stats();
-    }
-
-    fn resume_userspace(&mut self) {
-        println!("Unfreezing {} processes", self.frozen_processes.len());
-
-        let new_cstate_stats = self.get_cstate_stats();
-
-        let a = Instant::now();
-
-        let mut pstats = Vec::new();
-
-        for proc in self.frozen_processes.iter_mut().rev() {
-            let pstat = proc.resume();
-
-            if let Some(pstat) = pstat {
-                pstats.push(pstat);
-            }
-        }
-        let b = Instant::now();
-
-        self.cpus.powersave();
-
-        self.print_proc_stats(pstats);
-
-        println!("Unfreeze took {} seconds", (b - a).as_secs_f64());
-
-        self.print_cstate_stats(self.cstate_stats.clone(), new_cstate_stats);
-
-        let _ = execute::shell("rm /tmp/suspended_procs").output(); // best effort
-
-        //self.set_enabled_core_count(100);
-    }
-
-    fn print_proc_stats(&self, mut stats: Vec<ProcessStats>) {
-        println!("Process statistics:");
-
-        fn print_proc(s: &ProcessStats) {
-            println!(
-                "Process {} ({}) took {} utime, {} stime and had suspend state {}",
-                s.pid, s.command, s.utime, s.stime, s.was_suspended
-            );
-        }
-
-        stats.sort_by_key(|p| p.stime);
-
-        println!("By stime:");
-        stats.iter().rev().take(30).for_each(|s| {
-            if s.stime > 0 {
-                print_proc(s);
-            }
-        });
-
-        stats.sort_by_key(|p| p.utime);
-
-        println!("By utime:");
-        stats.iter().rev().take(30).for_each(|s| {
-            if s.utime > 0 {
-                print_proc(s);
-            }
-        });
-    }
-
-    fn load_us_modules(&mut self) {
-        modprobe_on_list(modprobe_list(), true);
-    }
-
-    fn unload_us_modules(&mut self) {
-        modprobe_on_list(
-            modprobe_list()
-                .iter()
-                .rev()
-                .map(|e| *e)
-                .collect::<Vec<&str>>()
-                .as_slice(),
-            false,
-        );
-    }
-
-    /// a minimum of 1 core is enabled regardless of requested count
-    fn set_enabled_core_count(&mut self, count: usize) {
-        println!("We have {} cpus available", num_cpus::get());
-        let bounded = count.max(1usize);
-
-        let bounded = bounded.min(num_cpus::get());
-
-        for idx in 0..bounded {}
-    }
-}
-
-impl PoweredDevice for Platform {
-    fn name(&self) -> &'static str {
-        "platform"
-    }
-
-    fn events(&self) -> &[DeviceStateTransition] {
-        self.log.as_slice()
-    }
-
-    fn events_mut(&mut self) -> &mut Vec<DeviceStateTransition> {
-        &mut self.log
-    }
-
-    fn detect(&mut self) {
-        // platform can't be managed except through here, so
-        // detection is unecessary
-        self.handle_detect(self.state());
-    }
-
-    fn enable(&mut self) {
-        panic!("Not applicable to platform")
-    }
-
-    fn disable(&mut self) {
-        panic!("Not applicable to platform")
-    }
-
-    fn resume(&mut self) {
-        // we can unconditionally resume since
-        // sending sigcont and doing modprobes is idempotent
-        match self.state().power {
-            DevicePowerState::PowerSave | DevicePowerState::Disabled => {
-                self.resume_userspace();
-
-                self.load_us_modules();
-
-                self.set_power(DevicePowerState::Enabled);
-            }
-            _ => (),
-        }
-    }
-
-    fn suspend(&mut self) {
-        match self.state().power {
-            DevicePowerState::Enabled => {
-                self.unload_us_modules();
-
-                self.suspend_userspace();
-
-                self.set_power(DevicePowerState::PowerSave);
-            }
-            _ => (),
-        }
-    }
-
-    fn state(&self) -> DeviceState {
-        self.state
-    }
-
-    fn set_power(&mut self, state: DevicePowerState) {
-        self.state.power = state;
-    }
-
-    fn should_block_sleep(&self) -> bool {
-        true
-    }
-}
-
-#[derive(Debug, Clone)]
 struct Wifi {
-    state: DeviceState,
-    log: Vec<DeviceStateTransition>,
+    suspended: bool,
+    disabled: bool,
+
+    //send: Sender<Trigger>,
+    recv: BusReader<Trigger>,
 }
 
 impl Wifi {
-    fn create() -> Box<Self> {
-        Box::new(Self {
-            state: DeviceState::unknown(),
-            log: vec![DeviceStateTransition::first()],
-        })
-    }
-}
-
-impl PoweredDevice for Wifi {
-    fn events(&self) -> &[DeviceStateTransition] {
-        self.log.as_slice()
+    fn new() -> Self {
+        //let (send, recv) = parallel::register();
+        Self {
+            recv: recver(),
+            suspended: false,
+            disabled: false,
+        }
     }
 
-    fn events_mut(&mut self) -> &mut Vec<DeviceStateTransition> {
-        &mut self.log
-    }
-
-    fn enable(&mut self) {
+    fn resume(&mut self) {
         let _ = execute::shell("nmcli radio wifi on").output();
-
-        self.state.power = DevicePowerState::Enabled;
     }
 
-    fn disable(&mut self) {
+    fn suspend(&mut self) {
         let _ = execute::shell("nmcli radio wifi off").output();
-
-        self.state.power = DevicePowerState::Disabled;
-    }
-
-    fn state(&self) -> DeviceState {
-        self.state
-    }
-
-    fn set_power(&mut self, state: DevicePowerState) {
-        self.state.power = state;
-    }
-
-    fn should_block_sleep(&self) -> bool {
-        true
     }
 
     fn detect(&mut self) {
         let cmdout = execute::shell("nmcli radio wifi").output().unwrap().stdout;
         let as_str = String::from_utf8(cmdout).unwrap();
 
-        self.state.present = DevicePresenceState::Present;
         if as_str.contains("enabled") {
-            self.state.power = DevicePowerState::Enabled;
+            self.disabled = false;
         } else {
-            self.state.power = match self.state.power {
-                DevicePowerState::Disabled => DevicePowerState::Disabled,
-                DevicePowerState::Enabled => DevicePowerState::PowerSave,
-                DevicePowerState::PowerSave => DevicePowerState::PowerSave,
-                DevicePowerState::Unknown => DevicePowerState::PowerSave,
-            }
+            self.disabled = true;
         }
-
-        self.handle_detect(self.state);
     }
 
-    fn name(&self) -> &'static str {
-        "wifi"
+    fn run(&mut self) {
+        use parallel::Action;
+        use parallel::Device;
+        use parallel::Progress;
+
+        while let Ok(trigger) = self.recv.recv() {
+            match (trigger.for_dev, trigger.announce) {
+                (Device::Platform(), Action::Resume()) => {
+                    if self.suspended && !self.disabled {
+                        self.resume();
+                    }
+
+                    Trigger {
+                        announce: Action::Reply(Progress::Resumed()),
+                        from_dev: Device::Wifi(),
+                        for_dev: Device::Anonymous(),
+                    }.send();
+                }
+                (Device::Platform(), Action::Suspend()) => {
+                    if !self.suspended {
+                        self.detect();
+
+                        if !self.disabled {
+                            self.suspend();
+                        }
+                    }
+
+                    Trigger {
+                        announce: Action::Reply(Progress::Suspended()),
+                        from_dev: Device::Wifi(),
+                        for_dev: Device::Anonymous(),
+                    }.send();
+                }
+                _ => (),
+            }
+        }
     }
 }
 
-#[derive(Debug, Clone)]
 struct Bluetooth {
-    state: DeviceState,
-    log: Vec<DeviceStateTransition>,
+    suspended: bool,
+    disabled: bool,
+
+    //send: Sender<Trigger>,
+    recv: BusReader<Trigger>,
 }
 
 impl Bluetooth {
-    fn create() -> Box<Self> {
-        Box::new(Self {
-            state: DeviceState::unknown(),
-            log: vec![DeviceStateTransition::first()],
-        })
-    }
-
-    fn status() -> String {
-        if let Ok(o) = execute::shell("rfkill list bluetooth").output() {
-            if let Ok(s) = String::from_utf8(o.stdout) {
-                return s;
-            }
+    fn new() -> Self {
+        //let (send, recv) = parallel::register();
+        Self {
+            recv: recver(),
+            suspended: false,
+            disabled: false,
         }
-
-        String::from("couldn't get bt status")
-    }
-}
-
-impl PoweredDevice for Bluetooth {
-    fn events(&self) -> &[DeviceStateTransition] {
-        self.log.as_slice()
     }
 
-    fn events_mut(&mut self) -> &mut Vec<DeviceStateTransition> {
-        &mut self.log
-    }
-
-    fn enable(&mut self) {
+    fn resume(&mut self) {
         println!("Enabling bluetooth bluetooth");
         let _ = execute::shell("rfkill unblock bluetooth").output();
         std::thread::sleep(Duration::from_millis(200)); // otherwise doesn't have long enough
-        println!("Status: {}", Self::status());
-        self.state.power = DevicePowerState::Enabled;
     }
 
-    fn disable(&mut self) {
+    fn suspend(&mut self) {
         println!("Disabling bluetooth");
         let _ = execute::shell("rfkill block bluetooth").output();
         std::thread::sleep(Duration::from_millis(200)); // otherwise doesn't have long enough
-        println!("Status: {}", Self::status());
-
-        self.state.power = DevicePowerState::Disabled;
-    }
-
-    fn state(&self) -> DeviceState {
-        self.state
-    }
-
-    fn set_power(&mut self, state: DevicePowerState) {
-        self.state.power = state;
-    }
-
-    fn should_block_sleep(&self) -> bool {
-        true
     }
 
     fn detect(&mut self) {
@@ -1569,191 +1379,53 @@ impl PoweredDevice for Bluetooth {
             .stdout;
         let as_str = String::from_utf8(cmdout).unwrap();
 
-        self.state.present = DevicePresenceState::Present;
         if as_str.contains("yes") {
-            self.state.power = DevicePowerState::Enabled;
+            self.disabled = false;
         } else {
-            self.state.power = match self.state.power {
-                DevicePowerState::Disabled => DevicePowerState::Disabled,
-                DevicePowerState::Enabled => DevicePowerState::PowerSave,
-                DevicePowerState::PowerSave => DevicePowerState::PowerSave,
-                DevicePowerState::Unknown => DevicePowerState::PowerSave,
+            self.disabled = true;
+        }
+    }
+
+    fn run(&mut self) {
+        use parallel::Action;
+        use parallel::Device;
+        use parallel::Progress;
+
+        while let Ok(trigger) = self.recv.recv() {
+            println!("bluetooth got trigger: {trigger:?}");
+            match (trigger.for_dev, trigger.announce) {
+                (Device::Platform(), Action::Resume()) => {
+                    println!("bluetooth resuming");
+
+                    if self.suspended && !self.disabled {
+                        self.resume();
+                    }
+
+                    Trigger {
+                        announce: Action::Reply(Progress::Resumed()),
+                        from_dev: Device::Bluetooth(),
+                        for_dev: Device::Anonymous(),
+                    }.send();
+
+                    println!("bluetooth done resume");
+                }
+                (Device::Platform(), Action::Suspend()) => {
+                    if !self.suspended {
+                        self.detect();
+
+                        if !self.disabled {
+                            self.suspend();
+                        }
+                    }
+
+                    Trigger {
+                        announce: Action::Reply(Progress::Suspended()),
+                        from_dev: Device::Bluetooth(),
+                        for_dev: Device::Anonymous(),
+                    }.send();
+                }
+                _ => (),
             }
-        }
-
-        self.handle_detect(self.state);
-    }
-
-    fn name(&self) -> &'static str {
-        "bluetooth"
-    }
-}
-
-trait PoweredDevice {
-    fn name(&self) -> &'static str;
-
-    /// Poll device state and update internal
-    /// state to match observed state
-    fn detect(&mut self);
-
-    fn handle_detect(&mut self, new_state: DeviceState) {
-        let old_state = *self.events().last().unwrap();
-
-        if new_state != old_state.new {
-            self.events_mut()
-                .push(DeviceStateTransition::new(old_state.new, new_state));
-        }
-    }
-
-    fn suspend(&mut self) {
-        let state_before = self.state().power;
-
-        println!("Disabling device by name {}", self.name());
-        self.disable();
-
-        let power = match state_before {
-            DevicePowerState::Enabled => DevicePowerState::PowerSave,
-            DevicePowerState::PowerSave => DevicePowerState::PowerSave,
-            DevicePowerState::Disabled => DevicePowerState::Disabled,
-            DevicePowerState::Unknown => DevicePowerState::Unknown,
-        };
-
-        self.set_power(power);
-
-        self.handle_detect(self.state());
-    }
-
-    fn resume(&mut self) {
-        match self.state().power {
-            DevicePowerState::PowerSave => {
-                println!("Resume calls enable for {}", self.name());
-                self.enable();
-            }
-            _ => (),
-        }
-
-        self.handle_detect(self.state());
-    }
-
-    fn enable(&mut self);
-    fn disable(&mut self);
-
-    fn state(&self) -> DeviceState;
-    fn set_power(&mut self, state: DevicePowerState);
-
-    /// If this device should be disabled or power saved
-    /// before sleep, this returns true
-    fn should_block_sleep(&self) -> bool;
-
-    fn events_mut(&mut self) -> &mut Vec<DeviceStateTransition>;
-
-    fn events(&self) -> &[DeviceStateTransition];
-
-    fn report(&mut self) -> Option<DeviceStatistic> {
-        self.detect();
-
-        let mut events = self.events().iter();
-
-        let mut prior = events.next().unwrap();
-
-        let mut ds = DeviceStatistic::default();
-
-        for evt in events {
-            println!("Dev {}, Looking at transition: {evt:?}", self.name());
-
-            let old = prior;
-            let new = evt;
-
-            let span_state = new.old;
-
-            let dur = new.time - old.time;
-
-            match span_state.power {
-                DevicePowerState::PowerSave => ds.time_sleeping += dur,
-                DevicePowerState::Enabled => ds.time_active += dur,
-                DevicePowerState::Disabled => ds.time_disabled += dur,
-                _ => {}
-            }
-        }
-
-        Some(ds)
-    }
-}
-
-struct Event {
-    time: Instant,
-
-    reason: EventReason,
-}
-
-impl Event {
-    pub fn new(reason: EventReason) -> Event {
-        Event {
-            time: Instant::now(),
-            reason,
-        }
-    }
-}
-
-use num_enum::{FromPrimitive, IntoPrimitive};
-
-#[derive(IntoPrimitive, FromPrimitive)]
-#[repr(u8)]
-#[derive(Clone, Copy, Debug)]
-enum EventReason {
-    #[default]
-    PowerButton,
-
-    LidOpen,
-    LidClose,
-
-    Suspend,
-    Resume,
-
-    PowerConnect,
-    PowerDisconnect,
-
-    DebugLowPowerStates,
-
-    Check,
-
-    Exit,
-}
-
-#[allow(dead_code)]
-struct Context {
-    log: Vec<Event>,
-
-    statistics: Vec<BatteryStatistic>,
-}
-
-impl Context {
-    #[allow(dead_code)]
-    pub fn default() -> Context {
-        Context {
-            log: vec![Event::new(EventReason::LidOpen)],
-            statistics: Vec::new(),
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn is_sleeping(&self) -> bool {
-        match self
-            .log
-            .iter()
-            .rev()
-            .filter(|p| match p.reason {
-                EventReason::LidOpen | EventReason::LidClose => true,
-                _ => false,
-            })
-            .next()
-        {
-            Some(e) => match e.reason {
-                EventReason::LidOpen => false,
-                EventReason::LidClose => true,
-                _ => unreachable!(),
-            },
-            None => false,
         }
     }
 }
@@ -1787,52 +1459,13 @@ impl Card {
     }
 }
 
-#[allow(dead_code)]
-fn change_vt(target: &str) {
-    std::process::Command::new("chvt")
-        .arg(&target[3..])
-        .output()
-        .unwrap();
-}
-
-fn testing() {
-    let s = std::thread::spawn(|| as_server());
-
-    as_client(EventReason::LidClose);
-
-    std::thread::sleep(Duration::from_secs(60));
-
-    as_client(EventReason::LidOpen);
-
-    as_client(EventReason::Exit);
-
-    s.join().unwrap();
-    //suspend_flow();
-
-    //std::thread::sleep(Duration::from_secs(3));
-
-    //resume_flow();
-    /********suspend_userspace();
-
-    std::thread::sleep(Duration::from_secs(5));
-
-    change_vt("tty6");
-
-    //Monitors::set_dpms_sus(DPMS::Suspend);
-
-    std::thread::sleep(Duration::from_secs_f64(20.0));
-
-    //Monitors::set_dpms_sus(DPMS::On);
-
-    std::thread::sleep(Duration::from_secs(5));
-
-    change_vt("tty2");
-
-    //std::process::Command::new("chvt").arg("2").output().unwrap();
-
-    //std::thread::sleep(Duration::from_secs(5));
-
-    resume_userspace();*/
+#[derive(Debug, Clone, Copy)]
+enum DPMSState {
+    On = 0,
+    Standby = 1,
+    Suspend = 2,
+    Off = 3,
+    Unknown,
 }
 
 struct Monitors {
@@ -1936,7 +1569,9 @@ impl Monitors {
         });
     }
 
-    fn set_resume_display(freed: &AtomicBool) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn set_resume_display(
+        freed: &AtomicBool,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         use drm::buffer::DrmFourcc;
         use drm::control::{connector, crtc};
 
@@ -1972,7 +1607,8 @@ impl Monitors {
         let (disp_width, disp_height) = mode.size();
 
         // Find a crtc and FB
-        let crtc = crtcinfo.get(0) //.expect("No crtcs found");
+        let crtc = crtcinfo
+            .get(0) //.expect("No crtcs found");
             .ok_or::<Box<dyn std::error::Error>>("No crtcs found".into())?; //.expect("No modes found on connector");
 
         // Select the pixel format
@@ -2125,378 +1761,27 @@ impl Monitors {
     }
 }
 
-fn pipe() -> Pipe {
-    let pipe = Pipe::with_name("idlefd3").unwrap();
-    pipe
-}
+use num_enum::{FromPrimitive, IntoPrimitive};
 
-/********fn sock() -> Bootstrapper<Message> {
-    let bootstrapper = Bootstrapper::bind("/tmp/idlefd2").unwrap();
-    bootstrapper
-}*/
+#[derive(IntoPrimitive, FromPrimitive)]
+#[repr(u8)]
+#[derive(Clone, Copy, Debug)]
+enum EventReason {
+    #[default]
+    PowerButton,
 
-fn as_client(msg: EventReason) {
-    //let v: u8 = msg.into();
-    //Sender::try_into
-    //pipe().send(msg).unwrap();
-    let mut p = pipe();
-    p.write(&[msg.into()]).unwrap();
-    let _ = p.close();
-}
+    LidOpen,
+    LidClose,
 
-async fn as_server() {
-    //let b = sock();
-    /*let b = sock();
-    let rcv = Receiver::connect("/tmp/idlefd2").unwrap();*/
+    Suspend,
+    Resume,
 
-    let mut pipe = pipe();
+    PowerConnect,
+    PowerDisconnect,
 
-    let mut system = System::new();
+    DebugLowPowerStates,
 
-    system.on_startup();
+    Check,
 
-    loop {
-        println!("Waiting for messages...");
-        //let msg: Message = rcv.recv().unwrap();
-        let mut msgb = [0u8];
-        //pipe.read_exact(&mut msgb).unwrap();
-        //let msg = Message::from_u8(msgb[0]);
-        //let msg = EventReason::from(msgb[0]);
-        //let msg: EventReason = msgb[0].try_into().unwrap();
-        if let Ok(_) = pipe.read_exact(&mut msgb) {
-            if let Ok(msg) = msgb[0].try_into() {
-                println!("Got a message! Message: {msg:?}");
-
-                match msg {
-                    EventReason::Exit => break,
-                    EventReason::Check => {
-                        system.print_report();
-                    }
-                    other => system.handle_acpi(other),
-                }
-            }
-        }
-    }
-}
-
-fn lock_blank_screen_gnome() {
-    let o = execute::shell("su sawyer -c \"DBUS_SESSION_BUS_ADDRESS='unix:path=/run/user/1000/bus' dbus-send --session --dest=org.gnome.ScreenSaver --type=method_call /org/gnome/ScreenSaver org.gnome.ScreenSaver.SetActive boolean:true\"").output().unwrap();
-
-    println!("Status: {}", o.status);
-    println!("Blank output: {}", String::from_utf8(o.stderr).unwrap());
-}
-
-fn lock_blank_screen_2() {}
-
-fn lock_blank_screen() {
-    for _i in 0..10 {
-        lock_blank_screen_gnome();
-
-        std::thread::sleep(Duration::from_secs_f64(2.0));
-
-        match Monitors::get_dpms_status() {
-            Ok(DPMSState::On) => {
-                println!("Monitor not yet asleep...");
-                continue; // we have confirmation that the monitor is *on*
-            }
-            Ok(_) => {
-                println!("Monitor suspended nicely");
-                break; // monitor is sleeping some way
-            }
-            Err(_) => {
-                println!("Error reading monitor state!!");
-                break;
-            }
-        }
-    }
-}
-
-fn modprobe(module: &str, load: bool) -> Option<()> {
-    match load {
-        true => Command::new("modprobe").arg(module).output(),
-        false => Command::new("modprobe").arg("-r").arg(module).output(),
-    }
-    .ok()?;
-
-    Some(())
-}
-
-fn modprobe_on_list(list: &[&str], load: bool) {
-    for elem in list {
-        modprobe(elem, load);
-    }
-}
-
-fn modprobe_list() -> &'static [&'static str] {
-    &[
-        "i2c_hid",
-        "i2c_hid_acpi",
-        "i2c_smbus",
-        "psmouse",
-        //"btusb",
-        //"btintel",
-        //"v4l2loopback",
-        //"dell_laptop",
-        //"dell_wmi",
-        //"bluetooth",
-    ]
-}
-
-#[derive(Debug, Clone)]
-struct Process {
-    pid: u32,
-    cmdline: String,
-    command: String,
-    //children: Mutex<Vec<Arc<Process>>>,
-}
-
-/*struct ProcessTree {
-    roots: Vec<Arc<Process>>
-}
-
-impl ProcessTree {
-    fn push(&mut self, p: Process) {
-    }
-}*/
-
-fn filter(procs: Vec<Process>, wl: Vec<&'static str>, include_list: bool) -> Vec<Process> {
-    let mut res = vec![];
-
-    'outer: for proc in procs {
-        for w in wl.iter() {
-            if proc.command.contains(w) {
-                if include_list {
-                    //println!("Adding {} {}", proc.command, proc.cmdline);
-                    res.push(proc);
-                    continue 'outer;
-                } else {
-                    //println!("Rejecting {} because {w}", proc.command);
-                    continue 'outer;
-                }
-            }
-
-            if proc.cmdline.contains(w) {
-                if include_list {
-                    //println!("Adding {} {}", proc.command, proc.cmdline);
-                    res.push(proc);
-                    continue 'outer;
-                } else {
-                    //println!("Rejecting {} because {w}", proc.command);
-                    continue 'outer;
-                }
-            }
-        }
-        //println!("Adding {} {}", proc.command, proc.cmdline);
-        if !include_list {
-            res.push(proc);
-        }
-    }
-
-    res
-}
-
-fn all_user_pids() -> Vec<u32> {
-    let psout = Command::new("ps").args(["-u", "sawyer"]).output().unwrap();
-
-    let mut pids_for_user = vec![];
-
-    for line in String::from_utf8(psout.stdout).unwrap().lines().skip(1) {
-        let pid: u32 = line.split_whitespace().nth(0).unwrap().parse().unwrap();
-        pids_for_user.push(pid);
-    }
-
-    pids_for_user
-}
-
-fn all_system_pids() -> Vec<u32> {
-    let psout = Command::new("ps").args(["-aux"]).output().unwrap();
-
-    let mut pids = vec![];
-
-    for line in String::from_utf8(psout.stdout).unwrap().lines().skip(1) {
-        let pid: u32 = line.split_whitespace().nth(1).unwrap().parse().unwrap();
-        pids.push(pid);
-    }
-
-    pids
-}
-
-fn read_all_procs(pids: Vec<u32>) -> Vec<Process> {
-    let mut res = Vec::new();
-    //let paths = fs::read_dir("/proc/").unwrap();
-
-    //let pids_for_user = all_user_pids();
-
-    for pid in pids {
-        let p = PathBuf::from_str(format!("/proc/{pid}/").as_str()).unwrap();
-        if p.exists() {
-            let path = p;
-
-            if (path
-                .file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .chars()
-                .nth(0)
-                .unwrap())
-            .is_numeric()
-            {
-                let pid: u32 = path.file_name().unwrap().to_str().unwrap().parse().unwrap();
-
-                let children = match path.read_dir() {
-                    Ok(children) => children,
-                    Err(_) => continue,
-                };
-
-                let mut cmdline = None;
-                let mut command = None;
-
-                for child in children {
-                    match child {
-                        Ok(child) => {
-                            let f = child.file_name();
-                            let fname = f.to_str().unwrap_or("");
-
-                            let contents = match fname {
-                                "comm" | "cmdline" => match fs::read_to_string(child.path()) {
-                                    Ok(contents) => contents,
-                                    Err(_) => continue,
-                                },
-                                _ => continue,
-                            };
-
-                            match fname {
-                                "comm" => command = Some(contents),
-                                "cmdline" => cmdline = Some(contents),
-                                _ => {}
-                            }
-                        }
-                        Err(_) => {}
-                    }
-                }
-
-                if let (Some(cmdline), Some(command)) = (cmdline, command) {
-                    res.push(Process {
-                        pid,
-                        cmdline,
-                        command,
-                    });
-                }
-            }
-        }
-    }
-
-    res
-}
-
-fn recover_proc_list() -> Vec<Process> {
-    let pf = fs::read_to_string("/tmp/suspend_proc_list").unwrap();
-
-    let mut procs = Vec::new();
-
-    for l in pf.lines() {
-        let pid: u32 = match l.parse() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-
-        procs.push(Process {
-            pid,
-            cmdline: String::new(),
-            command: String::new(),
-        })
-    }
-
-    return procs;
-}
-
-fn write_proc_list(procs: &Vec<Process>) {
-    let mut to_write = String::new();
-
-    use std::fmt::Write;
-    for proc in procs {
-        to_write
-            .write_str(format!("{}\n", proc.pid).as_str())
-            .unwrap();
-        //writeln!(to_write, "{}", proc.pid);
-        //to_write.wr
-    }
-
-    //let mut file = OpenOptions::new().write(true).open("/tmp/suspend_proc_list").unwrap();
-    let mut file = File::create("/tmp/suspend_proc_list").unwrap();
-
-    file.write_all(to_write.as_bytes()).unwrap();
-
-    //
-}
-
-/*#[derive(Clone, Copy)]
-enum Signal {
-    STOP,
-    CONT,
-}
-
-impl Signal {
-    fn as_str(&self) -> &'static str {
-        match self {
-            Self::STOP => "STOP",
-            Self::CONT => "CONT",
-        }
-    }
-}*/
-
-fn signal(proc: Process, signal: Signal) {
-    //println!("Sending {} to process: {proc:?}", signal.as_str());
-    //use std::process::Command;
-    //String signal = signal.to_string();
-    let pid = proc.pid;
-    //return;
-
-    //return;
-    /*let res = Command::new("kill")
-        .args(["-s", signal.as_str(), pid.to_string().as_str()])
-        .output();
-    match res {
-        Ok(_) => {}
-        Err(v) => {}
-    }*/
-
-    // Don't unwrap! This operation should continue even if lossy, otherwise too easy to just
-    // not wake back up from sleep
-    let _res = nix::sys::signal::kill(Pid::from_raw(pid as i32), signal);
-    match _res {
-        Ok(_) => {}
-        Err(v) => {
-            println!("Failed to send {signal} to process {pid}: {}", v);
-        }
-    }
-}
-
-mod monitoring {
-    use std::time::Duration;
-
-    /// If monitoring should be throttled/lowered,
-    /// this will be sent as an event over the info channel
-    pub enum Throttling {
-        StartThrottle,
-        EndThrottle,
-    }
-
-    pub enum MonitoringSignal {
-        Throttle(Throttling),
-    }
-
-    fn monitor(channel: std::sync::mpsc::Receiver<MonitoringSignal>) {
-        let mut poll_rate = Duration::from_secs(3);
-        let mut manager = battery::Manager::new();
-
-        let mut batt = manager
-            .unwrap()
-            .batteries()
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-    }
+    Exit,
 }
