@@ -8,7 +8,7 @@ use battery::*;
 use crossbeam::channel::{Receiver, Sender};
 use image::imageops;
 use panic_monitor::PanicMonitor;
-use parallel::{Trigger, recver};
+use parallel::Trigger;
 use procfs::process::{Stat, Status};
 use std::collections::HashMap;
 use std::env;
@@ -21,6 +21,7 @@ use std::str::FromStr;
 //use image::load_from_memory_with_format
 
 use std::sync::atomic::AtomicBool;
+use std::sync::Mutex;
 //use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -34,7 +35,7 @@ use ipipe::Pipe;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
-use crate::parallel::{send_commit, wait_all, wait_commit, send};
+use crate::parallel::{send, wait_all,GPU_TRIP, };
 //use rayon::prelude::*;
 //use serde::{Deserialize, Serialize};
 //use unix_ipc::{Bootstrapper, Receiver, Sender};
@@ -105,15 +106,19 @@ fn as_server() {
         || VT::new().run(),
         || Processes::new().run(),
         || server_loop(),
+        || Monitors::new().run(),
     ] {
+        println!("pushed handle for runner");
         let handle = std::thread::spawn(runner);
         //handles.push(handle.thread().id());
         handles.push(handle);
     }
 
     for handle in handles {
-        handle.join().unwrap();
+        //handle.join().unwrap();
     }
+
+    Logger::new().run();
 
     //PANIC_MONITOR.wait(handles.as_slice());
 
@@ -132,8 +137,10 @@ fn server_loop() {
         //let msg = EventReason::from(msgb[0]);
         //let msg: EventReason = msgb[0].try_into().unwrap();
         if let Ok(_) = pipe.read_exact(&mut msgb) {
+            println!("server loop got a message");
             if let Ok(msg) = msgb[0].try_into() {
-                println!("Got a message! Message: {msg:?}");
+                println!("msg: {msg:?}");
+                //println!("Got a message! Message: {msg:?}");
 
                 match msg {
                     EventReason::Exit => break,
@@ -172,14 +179,25 @@ fn handle_acpi(reason: EventReason) {
 }
 
 mod parallel {
-    use std::sync::Mutex;
+    use std::{collections::HashSet, sync::{Mutex, atomic::AtomicBool, Condvar, Barrier}};
 
     use bus::{Bus, BusReader};
     use crossbeam::channel::{Receiver, Sender};
-    use multiqueue::{BroadcastSender, BroadcastReceiver};
+    use multiqueue::{BroadcastReceiver, BroadcastSender};
     use once_cell::sync::OnceCell;
+    use semaphore::Semaphore;
 
-    #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+    //static owns_gpu: AtomicBool = AtomicBool::new(false);
+    //pub static gpu_trip: Condvar = Condvar::new();
+
+    lazy_static! {
+        pub static ref GPU_TRIP: Barrier = Barrier::new(2);
+    }
+
+
+    use crate::Broadcaster;
+
+    #[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
     pub enum Progress {
         PreStart(),
 
@@ -196,7 +214,7 @@ mod parallel {
         Enabled(),
     }
 
-    #[derive(PartialEq, Eq, Clone, Debug)]
+    #[derive(PartialEq, Eq, Clone, Debug, Hash)]
     pub enum Action {
         //Suspending(Progress),
         //Resuming(Progress),
@@ -217,7 +235,7 @@ mod parallel {
         Reply(Progress),
     }
 
-    #[derive(PartialEq, Eq, Clone, Copy, Debug)]
+    #[derive(PartialEq, Eq, Clone, Copy, Debug, Hash)]
     pub enum Device {
         CPUs(),
         Processes(),
@@ -232,7 +250,7 @@ mod parallel {
         Anonymous(),
     }
 
-    #[derive(PartialEq, Eq, Clone, Debug)]
+    #[derive(PartialEq, Eq, Clone, Debug, Hash)]
     pub struct Trigger {
         pub for_dev: Device,
         pub from_dev: Device,
@@ -250,7 +268,8 @@ mod parallel {
 
         pub fn send(self) {
             //let _ = register().0.send(self);
-            send(self)
+            //send(self)
+            Broadcaster::instance().send(self);
         }
     }
 
@@ -261,12 +280,13 @@ mod parallel {
         static ref BUS: Mutex<Bus<Trigger>> = Mutex::new(bus::Bus::new(100));
     }
 
-    pub fn recver() -> bus::BusReader<Trigger> {
+    /*pub fn recver() -> bus::BusReader<Trigger> {
         BUS.lock().unwrap().add_rx()
-    }
+    }*/
 
     pub fn send(t: Trigger) {
-        BUS.lock().unwrap().broadcast(t);
+        //BUS.lock().unwrap().broadcast(t);
+        Broadcaster::instance().send(t);
     }
 
     /*pub fn register() -> (Sender<Trigger>, Receiver<Trigger>) {
@@ -290,23 +310,30 @@ mod parallel {
             from_dev,
             for_dev: Device::Anonymous(),
             announce: Action::Commit(),
-        }.send();
+        }
+        .send();
     }
 
     /// returns only once all of the required announcement events
     /// have fired
-    pub fn wait_all(r: &mut BusReader<Trigger>, mut set: Vec<Trigger>) {
+    pub fn wait_all(r: &Receiver<Trigger>, set: Vec<Trigger>) {
+        let mut set: HashSet<Trigger> = set.into_iter().collect();
         while !set.is_empty() {
+            //println!("wait_all still waiting for: {set:?}");
             if let Ok(v) = r.recv() {
-                println!("Got a message: {v:?}");
-                set = set.into_iter().filter(|e| *e != v).collect();
+                //println!("Got a message: {v:?}");
+
+                set.remove(&v);
+                //set = set.into_iter().filter(|e| *e != v).collect();
             }
         }
     }
 
     pub fn wait_any(r: &mut Receiver<Trigger>, set: Vec<Trigger>) {
         while let Ok(v) = r.recv() {
+            println!("wait_any waiting for: {set:?}");
             if set.contains(&v) {
+                println!("wait_any returns");
                 break;
             }
         }
@@ -314,9 +341,8 @@ mod parallel {
 }
 
 struct Platform {
-    recv: BusReader<Trigger>,
+    recv: Receiver<Trigger>,
     //send: Sender<Trigger>,
-
     cstate_stats: Vec<u64>,
 }
 
@@ -330,7 +356,7 @@ impl Platform {
     fn new() -> Self {
         //let (send, recv) = parallel::register();
         Self {
-            recv: recver(),
+            recv: Broadcaster::instance().pair(),
             cstate_stats: vec![],
         }
     }
@@ -341,14 +367,15 @@ impl Platform {
         use parallel::Progress;
 
         while let Ok(trigger) = self.recv.recv() {
-            println!("platform got trigger: {trigger:?}");
+            //println!("platform got trigger: {trigger:?}");
+            println!("PLAT| platform got a trigger");
 
             match trigger.for_dev {
                 parallel::Device::Platform() => match trigger.announce {
                     Action::Resume() => {
-                        println!("platform starting resume");
+                        println!("PLAT| platform starting resume");
 
-                        println!("sent update");
+                        println!("PLAT| sent update");
 
                         let trigger = Trigger::new(
                             Action::Reply(Progress::Resuming()),
@@ -360,6 +387,8 @@ impl Platform {
                         //self.send.send(trigger).unwrap();
 
                         let mut wait_for = Vec::new();
+
+                        //self.unload_us_modules();
 
                         for dev in [
                             Device::CPUs(),
@@ -374,14 +403,7 @@ impl Platform {
                                 announce: Action::Resume(),
                             });*/
 
-                            println!("sending trigger to resume");
-
-                            //trigger.send();
-                            Trigger {
-                                from_dev: Device::Platform(),
-                                for_dev: dev,
-                                announce: Action::Resume(),
-                            }.send();
+                            println!("PLAT| sending trigger to resume");
 
                             wait_for.push(Trigger {
                                 for_dev: dev,
@@ -390,13 +412,13 @@ impl Platform {
                             })
                         }
 
-                        send_commit(Device::Platform());
+                        //send_commit(Device::Platform());
 
-                        println!("sent commit, waiting...");
+                        println!("PLAT| sent commit, waiting...");
 
                         wait_all(&mut self.recv, wait_for);
 
-                        println!("done wait");
+                        println!("PLAT| done wait");
 
                         /*self.send.send(Trigger {
                             for_dev: Device::VT(), announce: Action::Resume()
@@ -412,17 +434,20 @@ impl Platform {
 
                         //self.send.send(trigger).unwrap();
 
-                        println!("platform finished resume");
+                        println!("PLAT| platform finished resume");
 
                         //
                     }
                     Action::Suspend() => {
-                        println!("platform started suspend");
+                        println!("PLAT| platform started suspend");
                         Trigger {
                             from_dev: Device::Platform(),
                             for_dev: trigger.from_dev,
                             announce: Action::Reply(Progress::Suspending()),
-                        }.send();
+                        }
+                        .send();
+
+                        //self.load_us_modules();
 
                         let mut wait_for = Vec::new();
 
@@ -434,12 +459,6 @@ impl Platform {
                             Device::Processes(),
                             Device::VT(),
                         ] {
-                            Trigger {
-                                from_dev: Device::Platform(),
-                                for_dev: dev,
-                                announce: Action::Suspend(),
-                            }.send();
-
                             wait_for.push(Trigger {
                                 for_dev: dev,
                                 from_dev: Device::Platform(),
@@ -447,18 +466,17 @@ impl Platform {
                             })
                         }
 
-                        send_commit(Device::Platform());
-
                         std::thread::spawn(move || {
-                            wait_all(&mut recver(), wait_for);
+                            wait_all(&mut Broadcaster::instance().pair(), wait_for);
 
                             Trigger {
                                 from_dev: Device::Platform(),
                                 for_dev: trigger.from_dev,
                                 announce: Action::Reply(Progress::Suspended()),
-                            }.send();
+                            }
+                            .send();
 
-                            println!("platform finished suspend");
+                            println!("PLAT| platform finished suspend");
                         });
                     }
 
@@ -690,7 +708,7 @@ impl Platform {
 }
 
 struct VT {
-    recv: BusReader<Trigger>,
+    recv: Receiver<Trigger>,
     //send: Sender<Trigger>,
     suspended: bool,
     active_tty: String,
@@ -706,7 +724,7 @@ impl VT {
     fn new() -> Self {
         //let (send, recv) = parallel::register();
         Self {
-            recv: recver(),
+            recv: Broadcaster::instance().pair(),
             suspended: false,
             active_tty: String::new(),
         }
@@ -718,8 +736,11 @@ impl VT {
         use parallel::Progress;
 
         while let Ok(trigger) = self.recv.recv() {
+            //println!("vt got: {trigger:?}");
             match (trigger.for_dev, trigger.announce) {
                 (Device::Platform(), Action::Resume()) => {
+                    println!("VT  | vt asked to resume");
+
                     if self.suspended {
                         wait_all(
                             &mut self.recv,
@@ -737,18 +758,26 @@ impl VT {
                             ],
                         );
 
-                        self.suspended = true;
+                        println!("VT  | about to change vt");
+
+                        GPU_TRIP.wait();
+                        GPU_TRIP.wait();
 
                         self.change_vt(&self.active_tty);
                     }
+
+                    self.suspended = false;
 
                     Trigger {
                         from_dev: Device::VT(),
                         for_dev: Device::Anonymous(),
                         announce: Action::Reply(Progress::Resumed()),
-                    }.send();
+                    }
+                    .send();
                 }
                 (Device::Platform(), Action::Suspend()) => {
+                    println!("VT  | vt asked to suspend");
+
                     if !self.suspended {
                         self.active_tty = self.get_active_tty();
 
@@ -757,11 +786,14 @@ impl VT {
                         let _ = execute::shell("openvt --switch bash").output();
                     }
 
+                    self.suspended = true;
+
                     Trigger {
                         from_dev: Device::VT(),
                         for_dev: Device::Anonymous(),
                         announce: Action::Reply(Progress::Suspended()),
-                    }.send();
+                    }
+                    .send();
                 }
 
                 _ => (),
@@ -770,10 +802,12 @@ impl VT {
     }
 
     fn change_vt(&self, target: &str) {
-        std::process::Command::new("chvt")
+        let output = std::process::Command::new("chvt")
             .arg(&target[3..])
             .output()
             .unwrap();
+
+        println!("chvt: {}", String::from_utf8(output.stdout).unwrap());
     }
 
     fn get_active_tty(&mut self) -> String {
@@ -795,7 +829,7 @@ struct Processes {
     suspended: bool,
 
     //send: Sender<Trigger>,
-    recv: BusReader<Trigger>,
+    recv: Receiver<Trigger>,
 }
 
 impl Processes {
@@ -805,7 +839,7 @@ impl Processes {
             suspended: false,
             frozen_processes: vec![],
             processes: vec![],
-            recv: recver(),
+            recv: Broadcaster::instance().pair(),
         }
     }
 
@@ -825,9 +859,10 @@ impl Processes {
 
     fn suspend_userspace(&mut self) {
         self.frozen_processes = self.gather_procs();
+        println!("PROC| freezing {} processes", self.frozen_processes.len());
 
         for proc in self.frozen_processes.iter_mut() {
-            proc.suspend();
+            //proc.suspend();
         }
     }
 
@@ -882,29 +917,45 @@ impl Processes {
         use parallel::Progress;
 
         while let Ok(trigger) = self.recv.recv() {
+            println!("PROC| got trigger");
             match (trigger.for_dev, trigger.announce) {
                 (Device::Platform(), Action::Resume()) => {
                     if self.suspended {
-                        //self.resume_userspace();
+                        self.resume_userspace();
                     }
+
+                    self.suspended = false;
 
                     Trigger {
                         announce: Action::Reply(Progress::Resumed()),
                         from_dev: Device::Processes(),
                         for_dev: Device::Anonymous(),
-                    }.send();
+                    }
+                    .send();
                 }
 
                 (Device::Platform(), Action::Suspend()) => {
                     if !self.suspended {
-                        //self.suspend_userspace();
+                        wait_all(
+                            &mut self.recv,
+                            vec![Trigger {
+                                from_dev: Device::VT(),
+                                for_dev: Device::Anonymous(),
+                                announce: Action::Reply(Progress::Suspended()),
+                            }],
+                        );
+
+                        self.suspend_userspace();
                     }
+
+                    self.suspended = true;
 
                     Trigger {
                         announce: Action::Reply(Progress::Suspended()),
                         from_dev: Device::Processes(),
                         for_dev: Device::Anonymous(),
-                    }.send();
+                    }
+                    .send();
                 }
 
                 _ => (),
@@ -1120,7 +1171,7 @@ struct Cpus {
 
     //enabled: Vec<u64>,
     //send: Sender<Trigger>,
-    recv: BusReader<Trigger>,
+    recv: Receiver<Trigger>,
 
     suspended: bool,
 }
@@ -1132,31 +1183,39 @@ impl Cpus {
         use parallel::Progress;
 
         while let Ok(trigger) = self.recv.recv() {
+            println!("CPUS| got trigger");
             match (trigger.for_dev, trigger.announce) {
                 (Device::Platform(), Action::Resume()) => {
-                    println!("cpus told to resume");
+                    println!("CPUS| cpus told to resume");
                     if self.suspended {
                         self.powersave();
                     }
+
+                    self.suspended = false;
 
                     Trigger {
                         announce: Action::Reply(Progress::Resumed()),
                         from_dev: Device::CPUs(),
                         for_dev: Device::Anonymous(),
-                    }.send();
+                    }
+                    .send();
                 }
 
                 (Device::Platform(), Action::Suspend()) => {
-                    println!("cpus told to suspend");
+                    println!("CPUS| cpus told to suspend");
+
                     if !self.suspended {
-                        //self.superpowersave();
+                        self.superpowersave();
                     }
+
+                    self.suspended = true;
 
                     Trigger {
                         announce: Action::Reply(Progress::Suspended()),
                         from_dev: Device::CPUs(),
                         for_dev: Device::Anonymous(),
-                    }.send();
+                    }
+                    .send();
                 }
 
                 _ => (),
@@ -1214,7 +1273,7 @@ impl Cpus {
             .output();
 
             let _ = execute::shell(format!(
-                "echo 15 > /sys/devices/system/cpu/cpu{cpid}/power/energy_perf_bias"
+                "echo 10 > /sys/devices/system/cpu/cpu{cpid}/power/energy_perf_bias"
             ))
             .output();
         }
@@ -1246,7 +1305,7 @@ impl Cpus {
     fn superpowersave(&mut self) {
         // we will enable a single core
 
-        self.enable_count(1);
+        self.enable_count(4);
     }
 
     fn powersave(&mut self) {
@@ -1260,7 +1319,7 @@ impl Cpus {
     fn new() -> Self {
         //let (send, recv) = parallel::register();
         Self {
-            recv: recver(),
+            recv: Broadcaster::instance().pair(),
             suspended: false,
         }
     }
@@ -1268,19 +1327,19 @@ impl Cpus {
 
 struct Wifi {
     suspended: bool,
-    disabled: bool,
+    enabled: bool,
 
     //send: Sender<Trigger>,
-    recv: BusReader<Trigger>,
+    recv: Receiver<Trigger>,
 }
 
 impl Wifi {
     fn new() -> Self {
         //let (send, recv) = parallel::register();
         Self {
-            recv: recver(),
+            recv: Broadcaster::instance().pair(),
             suspended: false,
-            disabled: false,
+            enabled: true,
         }
     }
 
@@ -1293,14 +1352,14 @@ impl Wifi {
     }
 
     fn detect(&mut self) {
-        let cmdout = execute::shell("nmcli radio wifi").output().unwrap().stdout;
+        //let cmdout = execute::shell("nmcli radio wifi").output().unwrap().stdout;
+        let cmdout = execute::shell("rfkill list bluetooth")
+            .output()
+            .unwrap()
+            .stdout;
         let as_str = String::from_utf8(cmdout).unwrap();
 
-        if as_str.contains("enabled") {
-            self.disabled = false;
-        } else {
-            self.disabled = true;
-        }
+        self.enabled = !as_str.contains("yes");
     }
 
     fn run(&mut self) {
@@ -1309,32 +1368,37 @@ impl Wifi {
         use parallel::Progress;
 
         while let Ok(trigger) = self.recv.recv() {
+            println!("WIFI| got trigger");
             match (trigger.for_dev, trigger.announce) {
                 (Device::Platform(), Action::Resume()) => {
-                    if self.suspended && !self.disabled {
+                    if self.suspended && self.enabled {
                         self.resume();
                     }
+
+                    self.suspended = false;
 
                     Trigger {
                         announce: Action::Reply(Progress::Resumed()),
                         from_dev: Device::Wifi(),
                         for_dev: Device::Anonymous(),
-                    }.send();
+                    }
+                    .send();
                 }
                 (Device::Platform(), Action::Suspend()) => {
+                    self.detect();
                     if !self.suspended {
-                        self.detect();
 
-                        if !self.disabled {
-                            self.suspend();
-                        }
+                        self.suspend();
                     }
+
+                    self.suspended = true;
 
                     Trigger {
                         announce: Action::Reply(Progress::Suspended()),
                         from_dev: Device::Wifi(),
                         for_dev: Device::Anonymous(),
-                    }.send();
+                    }
+                    .send();
                 }
                 _ => (),
             }
@@ -1344,30 +1408,30 @@ impl Wifi {
 
 struct Bluetooth {
     suspended: bool,
-    disabled: bool,
+    enabled: bool,
 
     //send: Sender<Trigger>,
-    recv: BusReader<Trigger>,
+    recv: Receiver<Trigger>,
 }
 
 impl Bluetooth {
     fn new() -> Self {
         //let (send, recv) = parallel::register();
         Self {
-            recv: recver(),
+            recv: Broadcaster::instance().pair(),
             suspended: false,
-            disabled: false,
+            enabled: true,
         }
     }
 
     fn resume(&mut self) {
-        println!("Enabling bluetooth bluetooth");
+        println!("BLUT| Enabling bluetooth bluetooth");
         let _ = execute::shell("rfkill unblock bluetooth").output();
         std::thread::sleep(Duration::from_millis(200)); // otherwise doesn't have long enough
     }
 
     fn suspend(&mut self) {
-        println!("Disabling bluetooth");
+        println!("BLUT| Disabling bluetooth");
         let _ = execute::shell("rfkill block bluetooth").output();
         std::thread::sleep(Duration::from_millis(200)); // otherwise doesn't have long enough
     }
@@ -1379,11 +1443,7 @@ impl Bluetooth {
             .stdout;
         let as_str = String::from_utf8(cmdout).unwrap();
 
-        if as_str.contains("yes") {
-            self.disabled = false;
-        } else {
-            self.disabled = true;
-        }
+        self.enabled = !as_str.contains("yes");
     }
 
     fn run(&mut self) {
@@ -1392,37 +1452,44 @@ impl Bluetooth {
         use parallel::Progress;
 
         while let Ok(trigger) = self.recv.recv() {
-            println!("bluetooth got trigger: {trigger:?}");
+            //println!("bluetooth got trigger: {trigger:?}");
             match (trigger.for_dev, trigger.announce) {
                 (Device::Platform(), Action::Resume()) => {
-                    println!("bluetooth resuming");
+                    println!("BLUT| bluetooth resuming, enabled is: {}", self.enabled);
 
-                    if self.suspended && !self.disabled {
+                    if self.suspended && self.enabled {
+                        println!("BLUT| resumes bluetooth");
                         self.resume();
                     }
+
+                    self.suspended = false;
 
                     Trigger {
                         announce: Action::Reply(Progress::Resumed()),
                         from_dev: Device::Bluetooth(),
                         for_dev: Device::Anonymous(),
-                    }.send();
+                    }
+                    .send();
 
-                    println!("bluetooth done resume");
+                    println!("BLUT| bluetooth done resume");
                 }
                 (Device::Platform(), Action::Suspend()) => {
+                    self.detect();
                     if !self.suspended {
-                        self.detect();
 
-                        if !self.disabled {
-                            self.suspend();
-                        }
+                        println!("BLUT| bluetooth suspending, disabled is: {}", self.enabled);
+
+                        self.suspend();
                     }
+
+                    self.suspended = true;
 
                     Trigger {
                         announce: Action::Reply(Progress::Suspended()),
                         from_dev: Device::Bluetooth(),
                         for_dev: Device::Anonymous(),
-                    }.send();
+                    }
+                    .send();
                 }
                 _ => (),
             }
@@ -1473,6 +1540,11 @@ struct Monitors {
     dpms_handle: Option<drm::control::property::Handle>,
     conn_handle: Option<drm::control::connector::Handle>,
     card: Card,
+    suspended: bool,
+
+    //send: Sender<Trigger>,
+    recv: Receiver<Trigger>,
+    brightness: f32,
 }
 
 impl Monitors {
@@ -1483,9 +1555,12 @@ impl Monitors {
             card,
             dpms_handle: None,
             conn_handle: None,
+            suspended: false,
+            recv: Broadcaster::instance().pair(),
+            brightness: 100.0,
         };
 
-        m.refresh_dpms_info();
+        //let _ = m.refresh_dpms_info();
 
         m
     }
@@ -1498,7 +1573,7 @@ impl Monitors {
             let (ids, vals) = props.as_props_and_values();
 
             for (&id, &val) in ids.iter().zip(vals.iter()) {
-                //println!("Property: {:?}", id);
+                println!("Property: {:?}", id);
                 let info = self.card.get_property(id)?;
                 //println!("Val: {}", val);
 
@@ -1562,15 +1637,14 @@ impl Monitors {
         image::open(path).unwrap().to_rgba8()
     }
 
-    fn hold_resume_display() {
-        std::thread::spawn(|| {
+    fn hold_resume_display(&self) {
+        /*std::thread::spawn(|| {
             let cond = AtomicBool::new(false);
-            let _ = Self::set_resume_display(&cond);
-        });
+            let _ = self.set_resume_display(&cond);
+        });*/
     }
 
     fn set_resume_display(
-        freed: &AtomicBool,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         use drm::buffer::DrmFourcc;
         use drm::control::{connector, crtc};
@@ -1642,9 +1716,12 @@ impl Monitors {
 
             for (img_px, map_px) in img.pixels().zip(buffer.chunks_exact_mut(4)) {
                 // Assuming little endian, it's BGRA
-                map_px[0] = img_px[2]; // Blue
-                map_px[1] = img_px[1]; // Green
-                map_px[2] = img_px[0]; // Red
+                //map_px[0] = img_px[2]; // Blue
+                //map_px[1] = img_px[1]; // Green
+                //map_px[2] = img_px[0]; // Red
+                map_px[0] = u8::MIN;
+                map_px[1] = u8::MIN;
+                map_px[2] = u8::MIN;
                 map_px[3] = img_px[3]; // Alpha
             }
 
@@ -1672,22 +1749,19 @@ impl Monitors {
         //::std::thread::sleep(five_seconds);
         //std::thread::sleep_ms(700);
 
-        loop {
-            if freed.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep_ms(100);
-                break;
-            } else {
-                std::thread::sleep_ms(1000);
-            }
-        }
+        GPU_TRIP.wait();
 
-        //card.destroy_framebuffer(fb).unwrap();
-        //card.destroy_dumb_buffer(db).unwrap();
+
+
+        card.destroy_framebuffer(fb).unwrap();
+        card.destroy_dumb_buffer(db).unwrap();
+
+        GPU_TRIP.wait();
 
         Ok(())
     }
 
-    fn set_dpms(state: DPMSState) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn set_dpms(&self, state: DPMSState) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let card = Card::open_global();
         let resources = card.resource_handles()?;
 
@@ -1759,6 +1833,160 @@ impl Monitors {
 
         Err("nothing detected".into())
     }
+
+    fn fade_brightness(start: f32, end: f32, steps: usize) {
+        for sub in itertools_num::linspace::<f32>(start, end, steps) {
+            //println!("MON | sets light to {sub}");
+            let _ = execute::shell(format!("light -S {sub}")).output();
+            std::thread::sleep(Duration::from_millis(3));
+        }
+    }
+
+    fn run(&mut self) {
+        use parallel::Action;
+        use parallel::Device;
+        use parallel::Progress;
+
+        while let Ok(trigger) = self.recv.recv() {
+            let inner = Broadcaster::instance().pair();
+
+            println!("MON | got trigger");
+            //println!("bluetooth got trigger: {trigger:?}");
+            match (trigger.for_dev, trigger.announce) {
+                (Device::Platform(), Action::Resume()) => {
+                    println!("MON | monitors resuming");
+
+                    if self.suspended {
+                        let _ = execute::shell("light -S 0").output();
+                        let _ = self.set_dpms(DPMSState::On);
+                        let _ = execute::shell("light -S 0").output();
+
+                        //let sr: &'static _ = unsafe { std::mem::transmute(&inner)};
+
+                        let brightness = self.brightness;
+
+                        std::thread::spawn(move || {
+                            wait_all(
+                                //&mut Broadcaster::instance().pair(),
+                                &inner,
+                                vec![
+                                    /*Trigger {
+                                        for_dev: Device::Anonymous(),
+                                        from_dev: Device::VT(),
+                                        announce: Action::Reply(Progress::Resumed()),
+                                    },*/
+                                    /*Trigger {
+                                        for_dev: Device::Anonymous(),
+                                        from_dev: Device::Processes(),
+                                        announce: Action::Reply(Progress::Resumed()),
+                                    },*/
+                                ],
+                            );
+
+                            println!("MON | about to pull up brightness");
+
+                            //std::thread::sleep(Duration::from_millis(300));
+                            //std::thread::sleep(Duration::from_millis(30));
+
+                            Self::fade_brightness(0.0, brightness, 120);
+
+                            //for subdiv in itertools::
+                        });
+                    }
+
+                    self.suspended = false;
+
+                    Trigger {
+                        announce: Action::Reply(Progress::Resumed()),
+                        from_dev: Device::Display(),
+                        for_dev: Device::Anonymous(),
+                    }
+                    .send();
+
+                    println!("MON |  done resume");
+                }
+                (Device::Platform(), Action::Suspend()) => {
+                    if !self.suspended {
+                        println!("MON | waiting for vt switch");
+                        wait_all(
+                            &mut self.recv,
+                            vec![
+                                Trigger {
+                                    from_dev: Device::VT(),
+                                    for_dev: Device::Anonymous(),
+                                    announce: Action::Reply(Progress::Suspended()),
+                                },
+                                Trigger {
+                                    from_dev: Device::Processes(),
+                                    for_dev: Device::Anonymous(),
+                                    announce: Action::Reply(Progress::Suspended()),
+                                },
+                            ],
+                        );
+
+                        let bstring =
+                            String::from_utf8(execute::shell("light -G").output().unwrap().stdout)
+                                .unwrap();
+
+                        let _ = execute::shell(format!("light -S 0")).output();
+
+                        let bstring = bstring.trim().to_owned();
+                        println!("MON | Got brightness: '{bstring}'");
+
+                        let original_brightness = bstring.parse();
+
+                        self.brightness = original_brightness.unwrap_or(self.brightness);
+
+                        println!("MON | set dpms to standby");
+
+                        Self::fade_brightness(self.brightness, 0.0, 20);
+                        //
+                        let _ = execute::shell("light -S 0").output();
+
+                        std::thread::sleep(Duration::from_millis(100));
+
+                        let _ = self.set_dpms(DPMSState::Standby);
+
+                        std::thread::spawn(|| {
+                            let _ = Self::set_resume_display();
+                        });
+                    }
+
+                    self.suspended = true;
+
+                    Trigger {
+                        announce: Action::Reply(Progress::Suspended()),
+                        from_dev: Device::Display(),
+                        for_dev: Device::Anonymous(),
+                    }
+                    .send();
+                }
+                _ => (),
+            }
+        }
+    }
+}
+
+struct Logger {
+    recv: Receiver<Trigger>,
+}
+
+impl Logger {
+    pub fn new() -> Self {
+        Self {
+            recv: Broadcaster::instance().pair(),
+        }
+    }
+
+    pub fn run(&mut self) {
+        let start = Instant::now();
+
+        while let Ok(t) = self.recv.recv() {
+            println!("{:.8} logger got: {t:?}", start.elapsed().as_secs_f32());
+        }
+
+        println!("logger exited from error");
+    }
 }
 
 use num_enum::{FromPrimitive, IntoPrimitive};
@@ -1784,4 +2012,44 @@ enum EventReason {
     Check,
 
     Exit,
+}
+
+struct Broadcaster {
+    subscribers: Mutex<Vec<crossbeam::channel::Sender<Trigger>>>,
+}
+
+impl Broadcaster {
+    pub fn send(&self, t: Trigger) {
+        self.subscribers.lock().unwrap().iter().for_each(|s| {
+            //println!("pushed a message from broadcaster");
+            let _ = s.send(t.clone());
+        })
+    }
+
+    pub fn subscribe(&self, listening: crossbeam::channel::Sender<Trigger>) {
+        self.subscribers.lock().unwrap().push(listening);
+    }
+
+    pub fn pair(&self) -> crossbeam::channel::Receiver<Trigger> {
+        println!("broadcaster got pairing request");
+        let (a, b) = crossbeam::channel::unbounded();
+
+        self.subscribe(a);
+
+        b
+    }
+
+    pub fn new() -> Self {
+        Self {
+            subscribers: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn instance() -> &'static Self {
+        lazy_static! {
+            static ref INSTANCE: Broadcaster = Broadcaster::new();
+        };
+
+        &INSTANCE
+    }
 }

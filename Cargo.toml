@@ -36,6 +36,10 @@ panic_monitor = "*"
 multiqueue = "0.3.2"
 bus = "*"
 
+itertools = "*"
+itertools-num = "*"
+semaphore = "*"
+
 #drm-sys = "*"
 
 [dependencies.drm]
