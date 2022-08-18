@@ -35,7 +35,7 @@ use ipipe::Pipe;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 
-use crate::parallel::{send, wait_all,GPU_TRIP, };
+use crate::parallel::{send, wait_all, GPU_TRIP};
 //use rayon::prelude::*;
 //use serde::{Deserialize, Serialize};
 //use unix_ipc::{Bootstrapper, Receiver, Sender};
@@ -59,6 +59,7 @@ fn main() {
 
             "suspend" => as_client(EventReason::Suspend),
             "resume" => as_client(EventReason::Resume),
+            "rescue" => rescue_resume(),
             //"test" => testing(),
             _ => {}
         }
@@ -68,6 +69,23 @@ fn main() {
 fn pipe() -> Pipe {
     let pipe = Pipe::with_name("idlefd3").unwrap();
     pipe
+}
+
+fn rescue_resume() {
+    let mut processes = Processes::new();
+
+    let procs = processes.gather_procs();
+
+    for mut proc in procs {
+        println!("resuming {}", proc.pid());
+        proc.resume(true);
+    }
+
+    //let disp = Monitors::new();
+
+    let _ = Monitors::set_dpms(DPMSState::On);
+
+    let _ = execute::shell("light -S 100").output();
 }
 
 /********fn sock() -> Bootstrapper<Message> {
@@ -126,7 +144,15 @@ fn as_server() {
 }
 
 fn server_loop() {
+    {
+        let pipe = pipe();
+
+        let _ = std::fs::remove_file(pipe.path());
+    }
+
     let mut pipe = pipe();
+
+    //let _discard = pipe.read_to_end(&mut vec![]);
 
     loop {
         println!("Waiting for messages...");
@@ -179,7 +205,10 @@ fn handle_acpi(reason: EventReason) {
 }
 
 mod parallel {
-    use std::{collections::HashSet, sync::{Mutex, atomic::AtomicBool, Condvar, Barrier}};
+    use std::{
+        collections::HashSet,
+        sync::{atomic::AtomicBool, Barrier, Condvar, Mutex},
+    };
 
     use bus::{Bus, BusReader};
     use crossbeam::channel::{Receiver, Sender};
@@ -193,7 +222,6 @@ mod parallel {
     lazy_static! {
         pub static ref GPU_TRIP: Barrier = Barrier::new(2);
     }
-
 
     use crate::Broadcaster;
 
@@ -319,7 +347,7 @@ mod parallel {
     pub fn wait_all(r: &Receiver<Trigger>, set: Vec<Trigger>) {
         let mut set: HashSet<Trigger> = set.into_iter().collect();
         while !set.is_empty() {
-            //println!("wait_all still waiting for: {set:?}");
+            println!("wait_all still waiting for: {set:?}");
             if let Ok(v) = r.recv() {
                 //println!("Got a message: {v:?}");
 
@@ -357,8 +385,130 @@ impl Platform {
         //let (send, recv) = parallel::register();
         Self {
             recv: Broadcaster::instance().pair(),
-            cstate_stats: vec![],
+            cstate_stats: vec![0u64; 7],
         }
+    }
+
+    fn suspend(&mut self, trigger: Trigger) {
+        use parallel::Action;
+        use parallel::Device;
+        use parallel::Progress;
+
+        println!("PLAT| platform started suspend");
+        Trigger {
+            from_dev: Device::Platform(),
+            for_dev: trigger.from_dev,
+            announce: Action::Reply(Progress::Suspending()),
+        }
+        .send();
+
+        //self.load_us_modules();
+
+        let mut wait_for = Vec::new();
+
+        for dev in [
+            Device::CPUs(),
+            Device::Display(),
+            Device::Bluetooth(),
+            Device::Wifi(),
+            Device::Processes(),
+            Device::VT(),
+        ] {
+            wait_for.push(Trigger {
+                for_dev: dev,
+                from_dev: Device::Platform(),
+                announce: Action::Reply(Progress::Suspended()),
+            })
+        }
+
+        wait_all(&mut Broadcaster::instance().pair(), wait_for);
+
+        Trigger {
+            from_dev: Device::Platform(),
+            for_dev: trigger.from_dev,
+            announce: Action::Reply(Progress::Suspended()),
+        }
+        .send();
+
+        println!("PLAT| platform finished suspend");
+
+        std::thread::sleep(Duration::from_secs_f64(0.2));
+
+        self.cstate_stats = self.get_cstate_stats();
+    }
+
+    fn resume(&mut self, trigger: Trigger) {
+        use parallel::Action;
+        use parallel::Device;
+        use parallel::Progress;
+        println!("PLAT| platform starting resume");
+
+        println!("PLAT| sent update");
+
+        let trigger = Trigger::new(
+            Action::Reply(Progress::Resuming()),
+            Device::Platform(),
+            Device::Anonymous(),
+        );
+
+        trigger.send();
+        //self.send.send(trigger).unwrap();
+
+        let mut wait_for = Vec::new();
+
+        //self.unload_us_modules();
+
+        for dev in [
+            Device::CPUs(),
+            Device::Display(),
+            Device::Bluetooth(),
+            Device::Wifi(),
+            Device::Processes(),
+            Device::VT(),
+        ] {
+            /*let _ = self.send.send(Trigger {
+                for_dev: dev.clone(),
+                announce: Action::Resume(),
+            });*/
+
+            println!("PLAT| sending trigger to resume");
+
+            wait_for.push(Trigger {
+                for_dev: Device::Anonymous(),
+                from_dev: dev,
+                announce: Action::Reply(Progress::Resumed()),
+            })
+        }
+
+        let new_cstate_stats = self.get_cstate_stats();
+        self.print_cstate_stats(self.cstate_stats.clone(), new_cstate_stats);
+
+        //send_commit(Device::Platform());
+
+        println!("PLAT| sent commit, waiting...");
+
+        wait_all(&mut self.recv, wait_for);
+
+        println!("PLAT| done wait");
+
+        /*self.send.send(Trigger {
+            for_dev: Device::VT(), announce: Action::Resume()
+        });*/
+
+        let trigger = Trigger::new(
+            Action::Reply(Progress::Resumed()),
+            Device::Platform(),
+            Device::Anonymous(),
+        );
+
+        trigger.send();
+
+        //self.send.send(trigger).unwrap();
+
+        println!("PLAT| platform finished resume");
+
+
+        //
     }
 
     fn run(&mut self) {
@@ -372,113 +522,8 @@ impl Platform {
 
             match trigger.for_dev {
                 parallel::Device::Platform() => match trigger.announce {
-                    Action::Resume() => {
-                        println!("PLAT| platform starting resume");
-
-                        println!("PLAT| sent update");
-
-                        let trigger = Trigger::new(
-                            Action::Reply(Progress::Resuming()),
-                            Device::Platform(),
-                            Device::Anonymous(),
-                        );
-
-                        trigger.send();
-                        //self.send.send(trigger).unwrap();
-
-                        let mut wait_for = Vec::new();
-
-                        //self.unload_us_modules();
-
-                        for dev in [
-                            Device::CPUs(),
-                            Device::Display(),
-                            Device::Bluetooth(),
-                            Device::Wifi(),
-                            Device::Processes(),
-                            Device::VT(),
-                        ] {
-                            /*let _ = self.send.send(Trigger {
-                                for_dev: dev.clone(),
-                                announce: Action::Resume(),
-                            });*/
-
-                            println!("PLAT| sending trigger to resume");
-
-                            wait_for.push(Trigger {
-                                for_dev: dev,
-                                from_dev: Device::Platform(),
-                                announce: Action::Reply(Progress::Resumed()),
-                            })
-                        }
-
-                        //send_commit(Device::Platform());
-
-                        println!("PLAT| sent commit, waiting...");
-
-                        wait_all(&mut self.recv, wait_for);
-
-                        println!("PLAT| done wait");
-
-                        /*self.send.send(Trigger {
-                            for_dev: Device::VT(), announce: Action::Resume()
-                        });*/
-
-                        let trigger = Trigger::new(
-                            Action::Reply(Progress::Resumed()),
-                            Device::Platform(),
-                            Device::Anonymous(),
-                        );
-
-                        trigger.send();
-
-                        //self.send.send(trigger).unwrap();
-
-                        println!("PLAT| platform finished resume");
-
-                        //
-                    }
-                    Action::Suspend() => {
-                        println!("PLAT| platform started suspend");
-                        Trigger {
-                            from_dev: Device::Platform(),
-                            for_dev: trigger.from_dev,
-                            announce: Action::Reply(Progress::Suspending()),
-                        }
-                        .send();
-
-                        //self.load_us_modules();
-
-                        let mut wait_for = Vec::new();
-
-                        for dev in [
-                            Device::CPUs(),
-                            Device::Display(),
-                            Device::Bluetooth(),
-                            Device::Wifi(),
-                            Device::Processes(),
-                            Device::VT(),
-                        ] {
-                            wait_for.push(Trigger {
-                                for_dev: dev,
-                                from_dev: Device::Platform(),
-                                announce: Action::Reply(Progress::Suspended()),
-                            })
-                        }
-
-                        std::thread::spawn(move || {
-                            wait_all(&mut Broadcaster::instance().pair(), wait_for);
-
-                            Trigger {
-                                from_dev: Device::Platform(),
-                                for_dev: trigger.from_dev,
-                                announce: Action::Reply(Progress::Suspended()),
-                            }
-                            .send();
-
-                            println!("PLAT| platform finished suspend");
-                        });
-                    }
+                    Action::Resume() => self.resume(trigger),
+                    Action::Suspend() => self.suspend(trigger),
 
                     _ => (),
                 },
@@ -634,7 +679,12 @@ impl Platform {
     }
 
     fn print_cstate_stats(&self, old: Vec<u64>, new: Vec<u64>) {
-        println!("Cstate stats:");
+        use std::fmt::Write;
+
+        let mut deferred = String::new();
+
+        let _ = writeln!(deferred, "Cstate stats:");
+
         let combined: Vec<u64> = old.iter().zip(new.iter()).map(|(a, b)| b - a).collect();
 
         let labels = vec!["C2", "C3", "C6", "C7", "C8", "C9", "C10"];
@@ -643,10 +693,14 @@ impl Platform {
 
         let combined: Vec<(u64, &str)> = combined.into_iter().zip(labels.into_iter()).collect();
 
+
         for (state, label) in combined.iter() {
             let percent = 100.0 * (*state as f64 / total as f64);
-            println!("Package {label} : {percent:.03}% of total",)
+            //println!("Package {label} : {percent:.03}% of total",)
+            let _ = writeln!(deferred, "Package {label} : {percent:.03}% of total",);
         }
+
+        println!("{}", deferred);
     }
 
     fn load_us_modules(&mut self) {
@@ -745,11 +799,11 @@ impl VT {
                         wait_all(
                             &mut self.recv,
                             vec![
-                                Trigger {
+                                /*Trigger {
                                     from_dev: Device::Processes(),
                                     for_dev: Device::Anonymous(),
                                     announce: Action::Reply(Progress::Resumed()),
-                                },
+                                },*/
                                 Trigger {
                                     from_dev: Device::Display(),
                                     for_dev: Device::Anonymous(),
@@ -759,6 +813,8 @@ impl VT {
                         );
 
                         println!("VT  | about to change vt");
+
+                        //std::thread::sleep(Duration::from_secs(3));
 
                         GPU_TRIP.wait();
                         GPU_TRIP.wait();
@@ -783,7 +839,7 @@ impl VT {
 
                         let _ = execute::shell("echo 0 > /sys/class/graphics/fbcon/cursor_blink")
                             .output();
-                        let _ = execute::shell("openvt --switch bash").output();
+                        let _ = execute::shell("PS1=\"#\" openvt --switch bash").output();
                     }
 
                     self.suspended = true;
@@ -862,7 +918,7 @@ impl Processes {
         println!("PROC| freezing {} processes", self.frozen_processes.len());
 
         for proc in self.frozen_processes.iter_mut() {
-            //proc.suspend();
+            proc.suspend();
         }
     }
 
@@ -872,7 +928,7 @@ impl Processes {
         let mut pstats = Vec::new();
 
         for proc in self.frozen_processes.iter_mut().rev() {
-            let pstat = proc.resume();
+            let pstat = proc.resume(false);
 
             if let Some(pstat) = pstat {
                 pstats.push(pstat);
@@ -883,10 +939,15 @@ impl Processes {
     }
 
     fn print_proc_stats(&self, mut stats: Vec<ProcessStats>) {
-        println!("Process statistics:");
+        use std::fmt::Write;
 
-        fn print_proc(s: &ProcessStats) {
-            println!(
+        let mut deferred = String::new();
+
+        let _ = writeln!(deferred, "Process statistics:");
+
+        fn print_proc(deferred: &mut String, s: &ProcessStats) {
+            let _ = writeln!(
+                deferred,
                 "Process {} ({}) took {} utime, {} stime and had suspend state {}",
                 s.pid, s.command, s.utime, s.stime, s.was_suspended
             );
@@ -894,21 +955,23 @@ impl Processes {
 
         stats.sort_by_key(|p| p.stime);
 
-        println!("By stime:");
+        let _ = writeln!(deferred, "By stime:");
         stats.iter().rev().take(30).for_each(|s| {
             if s.stime > 0 {
-                print_proc(s);
+                print_proc(&mut deferred, s);
             }
         });
 
         stats.sort_by_key(|p| p.utime);
 
-        println!("By utime:");
+        let _ = writeln!(deferred, "By utime:");
         stats.iter().rev().take(30).for_each(|s| {
             if s.utime > 0 {
-                print_proc(s);
+                print_proc(&mut deferred, s);
             }
         });
+
+        println!("{deferred}");
     }
 
     pub fn run(&mut self) {
@@ -1077,6 +1140,8 @@ impl FreezableProcess {
             "power-usage-report",
             "turbostat",
             "sleep",
+            "wayfire",
+            "xdg-desktop",
         ]
     }
 
@@ -1126,7 +1191,7 @@ impl FreezableProcess {
         )
     }
 
-    pub fn resume(&mut self) -> Option<ProcessStats> {
+    pub fn resume(&mut self, override_resume: bool) -> Option<ProcessStats> {
         let new_stats = self.stats();
 
         let r = match (self.stats_on_freeze.clone(), new_stats) {
@@ -1142,7 +1207,7 @@ impl FreezableProcess {
             _ => None, // oh well
         };
 
-        if self.suspended {
+        if self.suspended || override_resume {
             //println!("Sending {} a sigcont", self.backing_process.stat.comm);
             self.signal(Signal::SIGCONT);
 
@@ -1344,22 +1409,26 @@ impl Wifi {
     }
 
     fn resume(&mut self) {
+        println!("Wifi turning on");
         let _ = execute::shell("nmcli radio wifi on").output();
     }
 
     fn suspend(&mut self) {
+        println!("Wifi turning off");
         let _ = execute::shell("nmcli radio wifi off").output();
     }
 
     fn detect(&mut self) {
-        //let cmdout = execute::shell("nmcli radio wifi").output().unwrap().stdout;
-        let cmdout = execute::shell("rfkill list bluetooth")
+        let cmdout = execute::shell("nmcli radio wifi").output().unwrap().stdout;
+        /*let cmdout = execute::shell("rfkill list bluetooth")
             .output()
             .unwrap()
-            .stdout;
+            .stdout;*/
         let as_str = String::from_utf8(cmdout).unwrap();
 
-        self.enabled = !as_str.contains("yes");
+        self.enabled = as_str.contains("enabled");
+
+        println!("WIFI| enabled says {}", self.enabled);
     }
 
     fn run(&mut self) {
@@ -1386,8 +1455,8 @@ impl Wifi {
                 }
                 (Device::Platform(), Action::Suspend()) => {
                     self.detect();
-                    if !self.suspended {
 
+                    if !self.suspended {
                         self.suspend();
                     }
 
@@ -1476,7 +1545,6 @@ impl Bluetooth {
                 (Device::Platform(), Action::Suspend()) => {
                     self.detect();
                     if !self.suspended {
-
                         println!("BLUT| bluetooth suspending, disabled is: {}", self.enabled);
 
                         self.suspend();
@@ -1644,124 +1712,130 @@ impl Monitors {
         });*/
     }
 
-    fn set_resume_display(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        use drm::buffer::DrmFourcc;
-        use drm::control::{connector, crtc};
-
-        let card = Card::open_global();
-
-        // Load the information.
-        let res = card.resource_handles()?;
-        //.expect("Could not load normal resource ids.");
-        let coninfo: Vec<connector::Info> = res
-            .connectors()
-            .iter()
-            .flat_map(|con| card.get_connector(*con))
-            .collect();
-        let crtcinfo: Vec<crtc::Info> = res
-            .crtcs()
-            .iter()
-            .flat_map(|crtc| card.get_crtc(*crtc))
-            .collect();
-
-        // Filter each connector until we find one that's connected.
-        let con = coninfo
-            .iter()
-            .find(|&i| i.state() == connector::State::Connected)
-            .ok_or::<Box<dyn std::error::Error>>("no connected connectors".into())?;
-        //.expect("No connected connectors");
-
-        // Get the first (usually best) mode
-        let &mode = con
-            .modes()
-            .get(0)
-            .ok_or::<Box<dyn std::error::Error>>("No modes found on connector".into())?; //.expect("No modes found on connector");
-
-        let (disp_width, disp_height) = mode.size();
-
-        // Find a crtc and FB
-        let crtc = crtcinfo
-            .get(0) //.expect("No crtcs found");
-            .ok_or::<Box<dyn std::error::Error>>("No crtcs found".into())?; //.expect("No modes found on connector");
-
-        // Select the pixel format
-        let fmt = DrmFourcc::Xrgb8888;
-
-        // Create a DB
-        // If buffer resolution is larger than display resolution, an ENOSPC (not enough video memory)
-        // error may occur
-        let mut db = card.create_dumb_buffer((disp_width.into(), disp_height.into()), fmt, 32)?;
-        //.expect("Could not create dumb buffer");
-
-        // Map it and grey it out.
+    fn set_resume_display() -> std::result::Result<(), Box<dyn std::error::Error>> {
         {
-            let mut map = card.map_dumb_buffer(&mut db)?;
-            //.expect("Could not map dumbbuffer");
+            use drm::buffer::DrmFourcc;
+            use drm::control::{connector, crtc};
 
-            let img = Self::load_image("/home/sawyer/default.png");
-            let img = imageops::resize(
-                &img,
-                disp_width as u32,
-                disp_height as u32,
-                imageops::FilterType::Triangle,
-            );
+            let card = Card::open_global();
 
-            let pixels = img.pixels();
+            // Load the information.
+            let res = card.resource_handles()?;
+            //.expect("Could not load normal resource ids.");
+            let coninfo: Vec<connector::Info> = res
+                .connectors()
+                .iter()
+                .flat_map(|con| card.get_connector(*con))
+                .collect();
+            let crtcinfo: Vec<crtc::Info> = res
+                .crtcs()
+                .iter()
+                .flat_map(|crtc| card.get_crtc(*crtc))
+                .collect();
 
-            let buffer = map.as_mut();
+            // Filter each connector until we find one that's connected.
+            let con = coninfo
+                .iter()
+                .find(|&i| i.state() == connector::State::Connected)
+                .ok_or::<Box<dyn std::error::Error>>("no connected connectors".into())?;
+            //.expect("No connected connectors");
 
-            println!("disp dims: {disp_width}, {disp_height}");
-            println!("Image dims: {}, {}", img.width(), img.height());
+            // Get the first (usually best) mode
+            let &mode = con
+                .modes()
+                .get(0)
+                .ok_or::<Box<dyn std::error::Error>>("No modes found on connector".into())?; //.expect("No modes found on connector");
 
-            for (img_px, map_px) in img.pixels().zip(buffer.chunks_exact_mut(4)) {
-                // Assuming little endian, it's BGRA
-                //map_px[0] = img_px[2]; // Blue
-                //map_px[1] = img_px[1]; // Green
-                //map_px[2] = img_px[0]; // Red
-                map_px[0] = u8::MIN;
-                map_px[1] = u8::MIN;
-                map_px[2] = u8::MIN;
-                map_px[3] = img_px[3]; // Alpha
+            let (disp_width, disp_height) = mode.size();
+
+            // Find a crtc and FB
+            let crtc = crtcinfo
+                .get(0) //.expect("No crtcs found");
+                .ok_or::<Box<dyn std::error::Error>>("No crtcs found".into())?; //.expect("No modes found on connector");
+
+            // Select the pixel format
+            let fmt = DrmFourcc::Xrgb8888;
+
+            // Create a DB
+            // If buffer resolution is larger than display resolution, an ENOSPC (not enough video memory)
+            // error may occur
+            let mut db =
+                card.create_dumb_buffer((disp_width.into(), disp_height.into()), fmt, 32)?;
+            //.expect("Could not create dumb buffer");
+
+            // Map it and grey it out.
+            {
+                let mut map = card.map_dumb_buffer(&mut db)?;
+                //.expect("Could not map dumbbuffer");
+
+                let img = Self::load_image("/home/sawyer/default.png");
+                let img = imageops::resize(
+                    &img,
+                    disp_width as u32,
+                    disp_height as u32,
+                    imageops::FilterType::Triangle,
+                );
+
+                let pixels = img.pixels();
+
+                let buffer = map.as_mut();
+
+                println!("disp dims: {disp_width}, {disp_height}");
+                println!("Image dims: {}, {}", img.width(), img.height());
+
+                for (img_px, map_px) in img.pixels().zip(buffer.chunks_exact_mut(4)) {
+                    // Assuming little endian, it's BGRA
+                    map_px[0] = img_px[2]; // Blue
+                    map_px[1] = img_px[1]; // Green
+                    map_px[2] = img_px[0]; // Red
+                                           //map_px[0] = u8::MAX;
+                                           //map_px[1] = u8::MAX;
+                                           //map_px[2] = u8::MAX;
+                    map_px[3] = img_px[3]; // Alpha
+                }
+
+                /*for b in map.as_mut().iter_mut().enumerate() {
+                }*/
+                /*for b in map.as_mut() {
+                    *b = 128;
+                }*/
             }
 
-            /*for b in map.as_mut().iter_mut().enumerate() {
-            }*/
-            /*for b in map.as_mut() {
-                *b = 128;
-            }*/
+            // Create an FB:
+            let fb = card.add_framebuffer(&db, 24, 32)?;
+            //.expect("Could not create FB");
+
+            println!("{:#?}", mode);
+            println!("{:#?}", fb);
+            println!("{:#?}", db);
+
+            // Set the crtc
+            // On many setups, this requires root access.
+            card.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))?;
+            //.expect("Could not set CRTC");
+
+            //let five_seconds = ::std::time::Duration::from_millis(5000);
+            //::std::thread::sleep(five_seconds);
+            //std::thread::sleep_ms(700);
+
+            let _ = execute::shell("light -S 0").output();
+
+            let _ = Self::set_dpms(DPMSState::Suspend);
+
+            let _ = Self::set_dpms(DPMSState::Suspend);
+
+            GPU_TRIP.wait();
+
+            card.destroy_framebuffer(fb).unwrap();
+            card.destroy_dumb_buffer(db).unwrap();
         }
-
-        // Create an FB:
-        let fb = card.add_framebuffer(&db, 24, 32)?;
-        //.expect("Could not create FB");
-
-        println!("{:#?}", mode);
-        println!("{:#?}", fb);
-        println!("{:#?}", db);
-
-        // Set the crtc
-        // On many setups, this requires root access.
-        card.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))?;
-        //.expect("Could not set CRTC");
-
-        //let five_seconds = ::std::time::Duration::from_millis(5000);
-        //::std::thread::sleep(five_seconds);
-        //std::thread::sleep_ms(700);
-
-        GPU_TRIP.wait();
-
-
-
-        card.destroy_framebuffer(fb).unwrap();
-        card.destroy_dumb_buffer(db).unwrap();
 
         GPU_TRIP.wait();
 
         Ok(())
     }
 
-    fn set_dpms(&self, state: DPMSState) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn set_dpms(state: DPMSState) -> std::result::Result<(), Box<dyn std::error::Error>> {
         let card = Card::open_global();
         let resources = card.resource_handles()?;
 
@@ -1783,7 +1857,7 @@ impl Monitors {
                         DPMSState::Unknown => return Err("had unknown dpms state!".into()),
                     };
 
-                    card.set_property(*conn_handle, id, num);
+                    let _ = card.set_property(*conn_handle, id, num);
                 }
             }
         }
@@ -1858,7 +1932,7 @@ impl Monitors {
 
                     if self.suspended {
                         let _ = execute::shell("light -S 0").output();
-                        let _ = self.set_dpms(DPMSState::On);
+                        let _ = Self::set_dpms(DPMSState::On);
                         let _ = execute::shell("light -S 0").output();
 
                         //let sr: &'static _ = unsafe { std::mem::transmute(&inner)};
@@ -1870,11 +1944,11 @@ impl Monitors {
                                 //&mut Broadcaster::instance().pair(),
                                 &inner,
                                 vec![
-                                    /*Trigger {
+                                    Trigger {
                                         for_dev: Device::Anonymous(),
                                         from_dev: Device::VT(),
                                         announce: Action::Reply(Progress::Resumed()),
-                                    },*/
+                                    },
                                     /*Trigger {
                                         for_dev: Device::Anonymous(),
                                         from_dev: Device::Processes(),
@@ -1888,7 +1962,7 @@ impl Monitors {
                             //std::thread::sleep(Duration::from_millis(300));
                             //std::thread::sleep(Duration::from_millis(30));
 
-                            Self::fade_brightness(0.0, brightness, 120);
+                            Self::fade_brightness(0.0, brightness, 60);
 
                             //for subdiv in itertools::
                         });
@@ -1939,16 +2013,19 @@ impl Monitors {
 
                         println!("MON | set dpms to standby");
 
-                        Self::fade_brightness(self.brightness, 0.0, 20);
+                        //Self::fade_brightness(self.brightness, 0.0, 20);
                         //
                         let _ = execute::shell("light -S 0").output();
 
                         std::thread::sleep(Duration::from_millis(100));
 
-                        let _ = self.set_dpms(DPMSState::Standby);
+                        let _ = Self::set_dpms(DPMSState::Suspend);
+                        //let _ = Self::set_dpms(DPMSState::Off);
 
                         std::thread::spawn(|| {
-                            let _ = Self::set_resume_display();
+                            GPU_TRIP.wait();
+                            GPU_TRIP.wait();
+                            //let _ = Self::set_resume_display();
                         });
                     }
 
