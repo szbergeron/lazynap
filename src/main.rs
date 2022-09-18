@@ -2,7 +2,7 @@
 #![feature(box_syntax)]
 
 use bus::BusReader;
-use drm::control::Device;
+use drm::control::{connector, property, Device};
 
 use battery::*;
 use crossbeam::channel::{Receiver, Sender};
@@ -83,7 +83,7 @@ fn rescue_resume() {
 
     //let disp = Monitors::new();
 
-    let _ = Monitors::set_dpms(DPMSState::On);
+    //let _ = Monitors::set_dpms(DPMSState::On);
 
     let _ = execute::shell("light -S 100").output();
 }
@@ -415,8 +415,8 @@ impl Platform {
             Device::VT(),
         ] {
             wait_for.push(Trigger {
-                for_dev: dev,
-                from_dev: Device::Platform(),
+                for_dev: Device::Anonymous(),
+                from_dev: dev,
                 announce: Action::Reply(Progress::Suspended()),
             })
         }
@@ -481,6 +481,7 @@ impl Platform {
         }
 
         let new_cstate_stats = self.get_cstate_stats();
+        println!("PLAT| cstate stats:");
         self.print_cstate_stats(self.cstate_stats.clone(), new_cstate_stats);
 
         //send_commit(Device::Platform());
@@ -506,7 +507,6 @@ impl Platform {
         //self.send.send(trigger).unwrap();
 
         println!("PLAT| platform finished resume");
-
 
         //
     }
@@ -693,7 +693,6 @@ impl Platform {
 
         let combined: Vec<(u64, &str)> = combined.into_iter().zip(labels.into_iter()).collect();
 
-
         for (state, label) in combined.iter() {
             let percent = 100.0 * (*state as f64 / total as f64);
             //println!("Package {label} : {percent:.03}% of total",)
@@ -799,11 +798,11 @@ impl VT {
                         wait_all(
                             &mut self.recv,
                             vec![
-                                /*Trigger {
+                                Trigger {
                                     from_dev: Device::Processes(),
                                     for_dev: Device::Anonymous(),
                                     announce: Action::Reply(Progress::Resumed()),
-                                },*/
+                                },
                                 Trigger {
                                     from_dev: Device::Display(),
                                     for_dev: Device::Anonymous(),
@@ -816,8 +815,8 @@ impl VT {
 
                         //std::thread::sleep(Duration::from_secs(3));
 
-                        GPU_TRIP.wait();
-                        GPU_TRIP.wait();
+                        //GPU_TRIP.wait();
+                        //GPU_TRIP.wait();
 
                         self.change_vt(&self.active_tty);
                     }
@@ -835,11 +834,28 @@ impl VT {
                     println!("VT  | vt asked to suspend");
 
                     if !self.suspended {
+                        wait_all(
+                            &mut self.recv,
+                            vec![Trigger {
+                                announce: Action::Reply(Progress::Suspending()),
+                                from_dev: Device::Display(),
+                                for_dev: Device::Anonymous(),
+                            }],
+                        );
+
+                        let _ = execute::shell(format!("light -S 0")).output();
+
+                        //Monitors::fade_brightness(, end, steps)
+
                         self.active_tty = self.get_active_tty();
+
+                        //let _ = execute::shell("light -S 0").output();
 
                         let _ = execute::shell("echo 0 > /sys/class/graphics/fbcon/cursor_blink")
                             .output();
                         let _ = execute::shell("PS1=\"#\" openvt --switch bash").output();
+
+                        //let _ = execute::shell("light -S 0").output();
                     }
 
                     self.suspended = true;
@@ -908,7 +924,7 @@ impl Processes {
 
         r.sort_by_key(|p| p.pid()); // first sort by pid to disambiguate parent-child within same jiffy
 
-        r.sort_by_key(|p| p.backing_process.stat().unwrap().starttime); // sort by start time, since pids could wrap
+        r.sort_by_key(|p| p.backing_process.stat().map(|proc| proc.starttime).unwrap_or(u64::MAX)); // sort by start time, since pids could wrap
 
         r
     }
@@ -920,6 +936,8 @@ impl Processes {
         for proc in self.frozen_processes.iter_mut() {
             proc.suspend();
         }
+
+        let _ = execute::shell("sudo -u sawyer XDG_RUNTIME_DIR=\"/run/user/$(id -u sawyer)\" systemctl --user stop wireplumber pipewire pipewire-pulse").output();
     }
 
     fn resume_userspace(&mut self) {
@@ -936,6 +954,8 @@ impl Processes {
         }
 
         self.print_proc_stats(pstats);
+
+        let _ = execute::shell("sudo -u sawyer XDG_RUNTIME_DIR=\"/run/user/$(id -u sawyer)\" systemctl --user start pipewire pipewire-pulse wireplumber").output();
     }
 
     fn print_proc_stats(&self, mut stats: Vec<ProcessStats>) {
@@ -980,7 +1000,7 @@ impl Processes {
         use parallel::Progress;
 
         while let Ok(trigger) = self.recv.recv() {
-            println!("PROC| got trigger");
+            //println!("PROC| got trigger");
             match (trigger.for_dev, trigger.announce) {
                 (Device::Platform(), Action::Resume()) => {
                     if self.suspended {
@@ -1142,6 +1162,7 @@ impl FreezableProcess {
             "sleep",
             "wayfire",
             "xdg-desktop",
+            "bash",
         ]
     }
 
@@ -1248,7 +1269,7 @@ impl Cpus {
         use parallel::Progress;
 
         while let Ok(trigger) = self.recv.recv() {
-            println!("CPUS| got trigger");
+            //println!("CPUS| got trigger");
             match (trigger.for_dev, trigger.announce) {
                 (Device::Platform(), Action::Resume()) => {
                     println!("CPUS| cpus told to resume");
@@ -1338,7 +1359,7 @@ impl Cpus {
             .output();
 
             let _ = execute::shell(format!(
-                "echo 10 > /sys/devices/system/cpu/cpu{cpid}/power/energy_perf_bias"
+                "echo 15 > /sys/devices/system/cpu/cpu{cpid}/power/energy_perf_bias"
             ))
             .output();
         }
@@ -1367,14 +1388,27 @@ impl Cpus {
         self.set_cpu_state(cpus);
     }
 
+    fn set_limits(&mut self, start: i32, end: i32) {
+        //execute::shell(format!("echo {start} > /sys/devices/system/cpu/intel_pstate/min_perf_pct")).output();
+        //execute::shell(format!("echo {end} > /sys/devices/system/cpu/intel_pstate/max_perf_pct")).output();
+    }
+
     fn superpowersave(&mut self) {
         // we will enable a single core
 
         self.enable_count(4);
+
+        self.set_limits(1, 80); // race to sleep, even if less efficient we
+                                // are aiming to gate 95+% of the time for
+                                // entire SoC, so curve matters less
     }
 
     fn powersave(&mut self) {
         self.enable_count(12); // just leave it, it's fine
+
+        self.set_limits(1, 30); // since we're "on" we want to more aggressively
+                                // limit freqs since dominant factor will be "all core"
+                                // laods so we want to hit sweet spot on curve
     }
 
     fn performance(&mut self) {
@@ -1421,9 +1455,9 @@ impl Wifi {
     fn detect(&mut self) {
         let cmdout = execute::shell("nmcli radio wifi").output().unwrap().stdout;
         /*let cmdout = execute::shell("rfkill list bluetooth")
-            .output()
-            .unwrap()
-            .stdout;*/
+        .output()
+        .unwrap()
+        .stdout;*/
         let as_str = String::from_utf8(cmdout).unwrap();
 
         self.enabled = as_str.contains("enabled");
@@ -1437,7 +1471,7 @@ impl Wifi {
         use parallel::Progress;
 
         while let Ok(trigger) = self.recv.recv() {
-            println!("WIFI| got trigger");
+            //println!("WIFI| got trigger");
             match (trigger.for_dev, trigger.announce) {
                 (Device::Platform(), Action::Resume()) => {
                     if self.suspended && self.enabled {
@@ -1607,8 +1641,10 @@ struct Monitors {
     //dpms_handle: Option<drm::control::property::Info>,
     dpms_handle: Option<drm::control::property::Handle>,
     conn_handle: Option<drm::control::connector::Handle>,
-    card: Card,
+    card: Option<Card>,
     suspended: bool,
+
+    card_info: Vec<(connector::Handle, property::Handle)>,
 
     //send: Sender<Trigger>,
     recv: Receiver<Trigger>,
@@ -1620,7 +1656,8 @@ impl Monitors {
         let card = Card::open_global();
 
         let mut m = Monitors {
-            card,
+            card_info: vec![],
+            card: None,
             dpms_handle: None,
             conn_handle: None,
             suspended: false,
@@ -1634,15 +1671,16 @@ impl Monitors {
     }
 
     fn refresh_dpms_info(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let resources = self.card.resource_handles()?;
+        let card = Card::open_global();
+        let resources = card.resource_handles()?;
 
         for conn_handle in resources.connectors() {
-            let props = self.card.get_properties(*conn_handle)?;
+            let props = card.get_properties(*conn_handle)?;
             let (ids, vals) = props.as_props_and_values();
 
             for (&id, &val) in ids.iter().zip(vals.iter()) {
                 println!("Property: {:?}", id);
-                let info = self.card.get_property(id)?;
+                let info = card.get_property(id)?;
                 //println!("Val: {}", val);
 
                 if info.name().to_str().unwrap() == "DPMS" {
@@ -1670,15 +1708,16 @@ impl Monitors {
     }
 
     fn get_dpms(&self) -> DPMSState {
+        let card = Card::open_global();
         match self.conn_handle {
             Some(v) => {
-                self.card.get_properties(v).unwrap();
+                card.get_properties(v).unwrap();
             }
             None => {}
         }
 
         match self.dpms_handle {
-            Some(handle) => match self.card.get_property(handle) {
+            Some(handle) => match card.get_property(handle) {
                 Ok(v) => {}
                 _ => {}
             },
@@ -1687,17 +1726,6 @@ impl Monitors {
 
         DPMSState::Unknown
     }
-
-    /*fn set_dpms_state(&mut self) {
-        match self.dpms_handle {
-            Some(handle) => {
-                //self.card.set_property(handle, , value)
-                self.card.set_property(handle, prop, value)
-
-            }
-            None => (),
-        }
-    }*/
 
     pub fn load_image(path: &str) -> image::RgbaImage {
         //let path = format!("examples/images/{}", name);
@@ -1712,7 +1740,7 @@ impl Monitors {
         });*/
     }
 
-    fn set_resume_display() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn set_resume_display(&mut self) -> std::result::Result<(), Box<dyn std::error::Error>> {
         {
             use drm::buffer::DrmFourcc;
             use drm::control::{connector, crtc};
@@ -1814,15 +1842,11 @@ impl Monitors {
             card.set_crtc(crtc.handle(), Some(fb), (0, 0), &[con.handle()], Some(mode))?;
             //.expect("Could not set CRTC");
 
-            //let five_seconds = ::std::time::Duration::from_millis(5000);
-            //::std::thread::sleep(five_seconds);
-            //std::thread::sleep_ms(700);
-
             let _ = execute::shell("light -S 0").output();
 
-            let _ = Self::set_dpms(DPMSState::Suspend);
+            let _ = self.set_dpms(DPMSState::Suspend, true);
 
-            let _ = Self::set_dpms(DPMSState::Suspend);
+            //let _ = Self::set_dpms(DPMSState::Suspend);
 
             GPU_TRIP.wait();
 
@@ -1835,30 +1859,54 @@ impl Monitors {
         Ok(())
     }
 
-    fn set_dpms(state: DPMSState) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let card = Card::open_global();
-        let resources = card.resource_handles()?;
+    fn set_dpms(
+        &mut self,
+        state: DPMSState,
+        refresh: bool,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        if refresh {
+            self.card = None;
+        }
 
-        for conn_handle in resources.connectors() {
-            let props = card.get_properties(*conn_handle)?;
-            let (ids, vals) = props.as_props_and_values();
+        let card = self.card.get_or_insert(Card::open_global());
 
-            for (&id, &val) in ids.iter().zip(vals.iter()) {
-                //println!("Property: {:?}", id);
-                let info = card.get_property(id)?;
-                //println!("Val: {}", val);
+        if refresh {
+            self.card_info = vec![];
 
-                if info.name().to_str().unwrap() == "DPMS" {
-                    let num = match state {
-                        DPMSState::On => 0,
-                        DPMSState::Standby => 1,
-                        DPMSState::Suspend => 2,
-                        DPMSState::Off => 3,
-                        DPMSState::Unknown => return Err("had unknown dpms state!".into()),
-                    };
+            let resources = card.resource_handles()?;
 
-                    let _ = card.set_property(*conn_handle, id, num);
+            'outer: for conn_handle in resources.connectors() {
+                let props = card.get_properties(*conn_handle)?;
+                let (ids, vals) = props.as_props_and_values();
+
+                for (&id, _v) in ids.iter().zip(vals.iter()) {
+                    //println!("Property: {:?}", id);
+                    let info = card.get_property(id)?;
+                    //println!("Val: {}", val);
+
+                    if info.name().to_str().unwrap() == "DPMS" {
+                        self.card_info.push((*conn_handle, id));
+                        break 'outer;
+                    }
                 }
+            }
+        }
+
+        let num = match state {
+            DPMSState::On => 0,
+            DPMSState::Standby => 1,
+            DPMSState::Suspend => 2,
+            DPMSState::Off => 3,
+            DPMSState::Unknown => return Err("had unknown dpms state!".into()),
+        };
+
+        for (conn_handle, id) in self.card_info.iter_mut() {
+            println!("MON | Setting dpms on conn {conn_handle:?}");
+            let v = card.set_property(*conn_handle, *id, num);
+            if let Err(e) = v {
+                println!("MON | Error setting dpms prop: {e:?}");
+            } else {
+                println!("MON | Successfully set DPMS")
             }
         }
 
@@ -1866,7 +1914,6 @@ impl Monitors {
     }
 
     fn get_dpms_status() -> std::result::Result<DPMSState, Box<dyn std::error::Error>> {
-        //let card = Card
         let card = Card::open_global();
         let resources = card.resource_handles()?;
 
@@ -1894,12 +1941,6 @@ impl Monitors {
                         3 => DPMSState::Off,
                         _ => unreachable!(),
                     });
-
-                    //info.value_type().convert_value(val)
-                    //card.set_property(*conn_handle, id, num).unwrap();
-                    //std::thread::sleep_ms(1000);
-                    //card.set_property(*conn_handle, id, 0).unwrap();
-                    //break 'outer;
                 }
             }
         }
@@ -1909,11 +1950,29 @@ impl Monitors {
     }
 
     fn fade_brightness(start: f32, end: f32, steps: usize) {
-        for sub in itertools_num::linspace::<f32>(start, end, steps) {
-            //println!("MON | sets light to {sub}");
-            let _ = execute::shell(format!("light -S {sub}")).output();
+        println!("MON | fading from {start} to {end} by {steps}");
+        let start_sample = 0.0;
+        let end_sample = end.log(5.0).into();
+
+        for (iter, x) in itertools_num::linspace::<f64>(start_sample, end_sample, steps).enumerate()
+        {
+            let sub = 5.0f64.powf(x);
+
+            //for sub in iter_num_tools::log_space(start..=end, steps) {
+            println!("MON | sets light to {sub}");
+            let _ = execute::shell(format!("light -S {sub}")).output(); // don't wait for
+                                                                        // completion, it's fine
+
+            // we want to spend less time for each step as we get brighter so we "fade in"
+            // exponentially
             std::thread::sleep(Duration::from_millis(3));
+
+            let speed_factor = 40.0;
+
+            //std::thread::sleep(Duration::from_secs_f64(0.001 * speed_factor * (1.0 / iter as f64)));
         }
+
+        let _ = execute::shell(format!("light -S {end}")).output(); // don't wait for
     }
 
     fn run(&mut self) {
@@ -1924,24 +1983,26 @@ impl Monitors {
         while let Ok(trigger) = self.recv.recv() {
             let inner = Broadcaster::instance().pair();
 
-            println!("MON | got trigger");
+            //println!("MON | got trigger");
             //println!("bluetooth got trigger: {trigger:?}");
             match (trigger.for_dev, trigger.announce) {
                 (Device::Platform(), Action::Resume()) => {
                     println!("MON | monitors resuming");
 
                     if self.suspended {
-                        let _ = execute::shell("light -S 0").output();
-                        let _ = Self::set_dpms(DPMSState::On);
-                        let _ = execute::shell("light -S 0").output();
-
-                        //let sr: &'static _ = unsafe { std::mem::transmute(&inner)};
-
                         let brightness = self.brightness;
+
+                        //let stat = Self::get_dpms_status();
+                        //println!("MON | Stat: {stat:?}");
+
+                        let _ = self.set_dpms(DPMSState::On, false); // we hopefully cached card
+                                                                     // info here
+                                                                     //std::thread::sleep(Duration::from_millis(50));
+
+                        self.card = None; // drop our master state
 
                         std::thread::spawn(move || {
                             wait_all(
-                                //&mut Broadcaster::instance().pair(),
                                 &inner,
                                 vec![
                                     Trigger {
@@ -1959,12 +2020,7 @@ impl Monitors {
 
                             println!("MON | about to pull up brightness");
 
-                            //std::thread::sleep(Duration::from_millis(300));
-                            //std::thread::sleep(Duration::from_millis(30));
-
-                            Self::fade_brightness(0.0, brightness, 60);
-
-                            //for subdiv in itertools::
+                            Self::fade_brightness(0.0, brightness, 70);
                         });
                     }
 
@@ -1982,6 +2038,20 @@ impl Monitors {
                 (Device::Platform(), Action::Suspend()) => {
                     if !self.suspended {
                         println!("MON | waiting for vt switch");
+
+                        //Self::fade_brightness(self.brightness, 0, 60);
+
+                        let bstring =
+                            String::from_utf8(execute::shell("light -G").output().unwrap().stdout)
+                                .unwrap();
+
+                        Trigger {
+                            announce: Action::Reply(Progress::Suspending()),
+                            from_dev: Device::Display(),
+                            for_dev: Device::Anonymous(),
+                        }
+                        .send();
+
                         wait_all(
                             &mut self.recv,
                             vec![
@@ -1998,10 +2068,6 @@ impl Monitors {
                             ],
                         );
 
-                        let bstring =
-                            String::from_utf8(execute::shell("light -G").output().unwrap().stdout)
-                                .unwrap();
-
                         let _ = execute::shell(format!("light -S 0")).output();
 
                         let bstring = bstring.trim().to_owned();
@@ -2011,22 +2077,26 @@ impl Monitors {
 
                         self.brightness = original_brightness.unwrap_or(self.brightness);
 
-                        println!("MON | set dpms to standby");
-
                         //Self::fade_brightness(self.brightness, 0.0, 20);
                         //
                         let _ = execute::shell("light -S 0").output();
 
-                        std::thread::sleep(Duration::from_millis(100));
+                        //std::thread::sleep(Duration::from_millis(500));
 
-                        let _ = Self::set_dpms(DPMSState::Suspend);
+                        println!("MON | set dpms to standby");
+
+                        let _ = self.set_dpms(DPMSState::Suspend, true);
+
+                        let stat = Self::get_dpms_status();
+                        println!("MON | Stat after suspend: {stat:?}");
+
                         //let _ = Self::set_dpms(DPMSState::Off);
 
-                        std::thread::spawn(|| {
+                        /*std::thread::spawn(|| {
                             GPU_TRIP.wait();
                             GPU_TRIP.wait();
                             //let _ = Self::set_resume_display();
-                        });
+                        });*/
                     }
 
                     self.suspended = true;
@@ -2129,4 +2199,13 @@ impl Broadcaster {
 
         &INSTANCE
     }
+}
+
+struct Timers {
+    currently_sleeping: bool,
+    currently_hibernating: bool,
+}
+
+impl Timers {
+    pub fn run(&mut self) {}
 }

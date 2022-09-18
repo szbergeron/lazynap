@@ -21,6 +21,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8fd72866655d1904d6b0997d0b07ba561047d070fbe29de039031c641b61217"
 
 [[package]]
+name = "array_builder"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b4889449b3c4d1813e5a5882ac706e88ae1ceeacc7b835a5e459099a597cc8"
+
+[[package]]
+name = "array_iter_tools"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eca6400f530f4ee3d9075bf1bf1e4fed2c1c4bedbd9a56ce7239f748167b191e"
+dependencies = [
+ "array_builder",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -440,6 +455,7 @@ dependencies = [
  "hhmmss",
  "image",
  "ipipe",
+ "iter_num_tools",
  "itertools",
  "itertools-num",
  "lazy_static",
@@ -484,6 +500,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "iter_num_tools"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7711c6efabc6320687553b58e0c9edc6a2ea8dcabac1c6d371cd544c81c33173"
+dependencies = [
+ "array_iter_tools",
+ "num-traits",
+]
+
+[[package]]
 name = "itertools"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -524,6 +550,12 @@ name = "libc"
 version = "0.2.126"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "349d5a591cd28b49e1d1037471617a32ddcda5731b99419008085f72d5a53836"
+
+[[package]]
+name = "libm"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "292a948cd991e376cf75541fe5b97a1081d713c618b4f1b9500f8844e49eb565"
 
 [[package]]
 name = "lock_api"
@@ -683,6 +715,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "578ede34cf02f8924ab9447f50c28075b4d3e5b269972345e7e0372b38c6cdcd"
 dependencies = [
  "autocfg",
+ "libm",
 ]
 
 [[package]]

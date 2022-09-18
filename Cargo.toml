@@ -40,6 +40,8 @@ itertools = "*"
 itertools-num = "*"
 semaphore = "*"
 
+iter_num_tools = "0.6.2"
+
 #drm-sys = "*"
 
 [dependencies.drm]
